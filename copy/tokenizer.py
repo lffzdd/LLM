@@ -26,4 +26,7 @@ class BPETokenizer:
         return word_list + ["</w>"]
 
     def _get_pair_freqs(self, word_freqs, tokenized_words):
-        word_pairs=
+        for word,token in tokenized_words.items():
+            freq=word_freqs[word]
+            for i in range(len(word)+1):
+                
