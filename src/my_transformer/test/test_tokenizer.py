@@ -1,4 +1,4 @@
-from my_transformer.tokenizer import BPETokenizer
+from my_transformer._1_tokenizer import BPETokenizer
 
 def test_merge_by_pair():
     tokenizer = BPETokenizer()
