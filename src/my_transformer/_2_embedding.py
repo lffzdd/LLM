@@ -8,7 +8,7 @@ class TokenEmbedding(nn.Module):
 
         self.vocab_size = vocab_size
         self.embed_dim = embed_dim
-        self.vocab_table = nn.parameter(torch.randn((vocab_size * embed_dim)))
+        self.vocab_table = nn.Parameter(torch.randn((vocab_size * embed_dim)))
 
     def forward(self, x):
         return self.vocab_table[x]
