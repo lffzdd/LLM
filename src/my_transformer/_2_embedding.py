@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+from torch import Tensor
 
 
 class TokenEmbedding(nn.Module):
@@ -8,7 +9,14 @@ class TokenEmbedding(nn.Module):
 
         self.vocab_size = vocab_size
         self.embed_dim = embed_dim
-        self.vocab_table = nn.Parameter(torch.randn((vocab_size * embed_dim)))
+        self.vocab_table = nn.Parameter(torch.randn((vocab_size, embed_dim)))
 
-    def forward(self, x):
+    def forward(self, x: Tensor) -> Tensor:
+        """
+        Args:
+            x: token IDs, 形状 [batch_size, seq_len]
+        Returns:
+            嵌入向量, 形状 [batch_size, seq_len, embed_dim]
+        """
+
         return self.vocab_table[x]
