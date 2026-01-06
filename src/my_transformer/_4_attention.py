@@ -53,7 +53,7 @@ class MultiHeadSelfAttention(nn.Module):
         embed_dim: int,
         head_num: int,
         k_dim: int,
-        max_seq_len: int = 512,
+        dropout: float = 0.1,
         *args,
         **kwargs,
     ) -> None:
@@ -67,6 +67,8 @@ class MultiHeadSelfAttention(nn.Module):
         self.w_q = nn.Linear(embed_dim, head_num * k_dim)
         self.w_k = nn.Linear(embed_dim, head_num * k_dim)
         self.w_v = nn.Linear(embed_dim, head_num * k_dim)
+
+        self.attn_dropout = nn.Dropout(dropout)
 
         self.w_o = nn.Linear(head_num * k_dim, embed_dim)
 
@@ -98,6 +100,9 @@ class MultiHeadSelfAttention(nn.Module):
         if mask is not None:
             scores = scores.masked_fill(mask, -1e9)
 
+        scores = scores.softmax(dim=-1)
+        scores = self.attn_dropout(scores)
+
         # [batch, head_num, seq_len, seq_len] @ [batch, head_num, seq_len, k_dim]
         # → [batch, head_num, seq_len, k_dim]
         output = scores @ V
@@ -105,6 +110,88 @@ class MultiHeadSelfAttention(nn.Module):
         # [batch, head_num, seq_len, k_dim] → [batch, seq_len, head_num * k_dim]
         output = output.transpose(1, 2).contiguous()
         output = output.view(batch_size, seq_len, self.head_num * self.k_dim)
+
+        # ========== 线性变换 ==========
+        output = self.w_o(output)
+
+        return output
+
+
+class MultiHeadCrossAttention(nn.Module):
+    def __init__(
+        self,
+        embed_dim: int,
+        head_num: int,
+        k_dim: int,
+        dropout: float = 0.1,
+        *args,
+        **kwargs,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+
+        self.embed_dim = embed_dim
+        self.head_num = head_num
+        self.k_dim = k_dim
+        self.scale = k_dim**0.5
+
+        self.w_q = nn.Linear(embed_dim, head_num * k_dim)
+        self.w_k = nn.Linear(embed_dim, head_num * k_dim)
+        self.w_v = nn.Linear(embed_dim, head_num * k_dim)
+
+        self.attn_dropout = nn.Dropout(dropout)
+
+        self.w_o = nn.Linear(head_num * k_dim, embed_dim)
+
+    def forward(
+        self,
+        dec_input: Tensor,
+        enc_output: Tensor,
+        src_padding_mask: Tensor | None = None,
+    ):
+        """
+        dec_input:  [batch_size, target_seq_len, embed_dim] ← Decoder 的输入
+        enc_output: [batch_size, source_seq_len, embed_dim] ← Encoder 的输出
+        """
+        batch_size, target_seq_len, embed_dim = dec_input.shape
+        source_seq_len = enc_output.shape[1]
+
+        Q: Tensor = self.w_q(
+            dec_input
+        )  # [batch_size, target_seq_len, k_dim * head_num]
+        K: Tensor = self.w_k(enc_output)
+        V: Tensor = self.w_v(enc_output)
+
+        # ========== 分头 ==========
+        # 步骤 1: view 拆分最后一维
+        # [batch_size, target_seq_len, head_num * k_dim] → [batch_size, target_seq_len, head_num, k_dim]
+        Q = Q.view(batch_size, target_seq_len, self.head_num, self.k_dim)
+        K = K.view(batch_size, source_seq_len, self.head_num, self.k_dim)
+        V = V.view(batch_size, source_seq_len, self.head_num, self.k_dim)
+
+        # 步骤 2: transpose 把 head_num 移到前面
+        # [batch_size, target_seq_len, head_num, k_dim] → [batch_size, head_num, target_seq_len, k_dim]
+        Q = Q.transpose(1, 2)  # 交换维度 1 和 2
+        K = K.transpose(1, 2)
+        V = V.transpose(1, 2)
+
+        # ========== 计算注意力（每个头独立计算）==========
+        # [batch, head_num, target_seq_len, k_dim] @ [batch, head_num, k_dim, source_seq_len]
+        # → [batch, head_num, target_seq_len, source_seq_len]
+        scores = Q @ K.transpose(-2, -1) / self.scale
+
+        if src_padding_mask is not None:
+            scores = scores.masked_fill(src_padding_mask, -1e9)
+
+        scores = scores.softmax(dim=-1)
+        scores = self.attn_dropout(scores)
+
+        # [batch, head_num, target_seq_len, source_seq_len] @ [batch, head_num, source_seq_len, k_dim]
+        # → [batch, head_num, target_seq_len, k_dim]
+        output = scores @ V
+
+        # [batch, head_num, target_seq_len, k_dim] → [batch, target_seq_len, head_num * k_dim]
+        output = output.transpose(1, 2).contiguous()
+        output = output.view(batch_size, target_seq_len, self.head_num * self.k_dim)
 
         # ========== 线性变换 ==========
         output = self.w_o(output)
