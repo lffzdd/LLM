@@ -47,6 +47,11 @@ class DecoderLayer(nn.Module):
         tgt_padding_mask: Tensor | None = None,  # Padding 掩码
         src_padding_mask: Tensor | None = None,  # Padding 掩码
     ):
+        """
+        x:[batch_size, seq_len, embed_dim]
+        enc_output:[batch_size, seq_len, embed_dim]
+        """
+
         attn_output = self.mask_attn(
             x, self._combine_masks(tgt_scores_mask, tgt_padding_mask)
         )
@@ -61,6 +66,10 @@ class DecoderLayer(nn.Module):
         return x
 
     def _combine_masks(self, scores_mask: Tensor, padding_mask: Tensor):
+        """
+        scores_mask:[batch_size, seq_len, seq_len]
+        padding_mask:[batch_size, seq_len]
+        """
         if scores_mask is None and padding_mask is None:
             return None
         if scores_mask is None:
@@ -109,6 +118,10 @@ class Decoder(nn.Module):
         tgt_padding_mask: Tensor | None = None,
         src_padding_mask: Tensor | None = None,
     ):
+        """
+        x:[batch_size, seq_len]
+        enc_output:[batch_size, seq_len, embed_dim]
+        """
         # x:[batch_size, seq_len] -> [batch_size, seq_len, embed_dim] 这里的seq序列已经被pad填充过了
         x = self.embedding(x)
         x = self.positional_encoding(x)
