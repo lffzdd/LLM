@@ -1,3 +1,5 @@
+import math
+
 import torch
 import torch.nn as nn
 from torch import Tensor
@@ -36,9 +38,9 @@ class PositionalEncoder(nn.Module):
         for pos in range(max_seq_len):
             for i in range(embed_dim):
                 if i % 2 == 0:
-                    pos_vec[pos, i] = torch.sin(pos / (10000 ** (i / embed_dim)))
+                    pos_vec[pos, i] = math.sin(pos / (10000 ** (i / embed_dim)))
                 else:
-                    pos_vec[pos, i] = torch.cos(pos / (10000 ** ((i - 1) / embed_dim)))
+                    pos_vec[pos, i] = math.cos(pos / (10000 ** ((i - 1) / embed_dim)))
 
         """这是向量化计算方式
         pos=torch.arange(max_seq_len,device=pos_vec.device).unsqueeze(1)

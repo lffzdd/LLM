@@ -2,9 +2,9 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 
-from src.my_transformer._3_positional_encoding import PositionalEncoder
-from src.my_transformer._2_embedding import TokenEmbedding
-from src.my_transformer._4_attention import MultiHeadSelfAttention
+from my_transformer._3_positional_encoding import PositionalEncoder
+from my_transformer._2_embedding import TokenEmbedding
+from my_transformer._4_attention import MultiHeadSelfAttention
 
 
 class EncoderLayer(nn.Module):

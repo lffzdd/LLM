@@ -48,8 +48,11 @@ class Transformer(nn.Module):
 
     def forward(self, src_seq: Tensor, tgt_seq: Tensor):
         """
-        src_seq:[batch_size, seq_len]
-        tgt_seq:[batch_size, seq_len]
+        Args:
+            src: [batch, src_seq_len] 源序列
+            tgt: [batch, tgt_seq_len] 目标序列
+        Returns:
+            output: [batch, tgt_seq_len, vocab_size]
         """
         src_padding_mask = create_padding_mask(src_seq, self.pad_id)
         enc_output = self.encoder(src_seq, src_padding_mask)
