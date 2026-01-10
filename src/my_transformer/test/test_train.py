@@ -41,3 +41,4 @@ dataloader = DataLoader(dataset, batch_size=2, collate_fn=collate_fn)
 # 训练一个epoch
 loss = trainer.train_epoch(dataloader)
 print(f"Train OK: loss = {loss:.4f}")
+  
