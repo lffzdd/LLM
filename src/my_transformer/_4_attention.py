@@ -38,7 +38,7 @@ class SelfAttention(nn.Module):
         scores = Q @ K.transpose(-2, -1) / self.scale
 
         # 不需要的分数掩码处理
-        scores = scores.masked_fill(self.scores_mask[:seq_len, :seq_len], -1e9)
+        scores = scores.masked_fill(self.scores_mask[:seq_len, :seq_len], -1e4)
         scores = scores.softmax(dim=-1)
 
         output = scores @ V
@@ -98,7 +98,7 @@ class MultiHeadSelfAttention(nn.Module):
         scores = Q @ K.transpose(-2, -1) / self.scale
 
         if mask is not None:
-            scores = scores.masked_fill(mask, -1e9)
+            scores = scores.masked_fill(mask, -1e4)  # FP16 兼容
 
         scores = scores.softmax(dim=-1)
         scores = self.attn_dropout(scores)
@@ -180,7 +180,7 @@ class MultiHeadCrossAttention(nn.Module):
         scores = Q @ K.transpose(-2, -1) / self.scale
 
         if src_padding_mask is not None:
-            scores = scores.masked_fill(src_padding_mask, -1e9)
+            scores = scores.masked_fill(src_padding_mask, -1e4)  # FP16 兼容
 
         scores = scores.softmax(dim=-1)
         scores = self.attn_dropout(scores)

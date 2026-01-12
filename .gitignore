@@ -35,3 +35,6 @@ out/
 .idea/
 .DS_Store
 Thumbs.db
+
+# model files
+*.pt

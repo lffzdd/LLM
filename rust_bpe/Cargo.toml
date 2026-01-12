@@ -1,0 +1,20 @@
+[package]
+name = "rust_bpe"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# 用于序列化/反序列化（保存和加载 tokenizer）
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# 用于进度条
+indicatif = "0.17"
+
+[lib]
+name = "rust_bpe"
+path = "src/lib.rs"
+
+[[bin]]
+name = "bpe_demo"
+path = "src/main.rs"

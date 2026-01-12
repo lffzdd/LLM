@@ -31,8 +31,18 @@ class TranslationDataset(Dataset):
         return len(self.src_texts)
 
     def __getitem__(self, idx):
+        # 特殊 token id
+        BOS_ID = 2
+        EOS_ID = 3
+
+        # src 不需要 BOS/EOS（Encoder 只是编码）
         src_ids = self.src_tokenizer.encode(self.src_texts[idx])[: self.max_len]
-        tgt_ids = self.tgt_tokenizer.encode(self.tgt_texts[idx])[: self.max_len]
+
+        # tgt 必须有 BOS 和 EOS（Decoder 需要知道起点和终点）
+        tgt_ids = self.tgt_tokenizer.encode(self.tgt_texts[idx])[
+            : self.max_len - 2
+        ]  # 留出空间给 BOS/EOS
+        tgt_ids = [BOS_ID] + tgt_ids + [EOS_ID]  # 添加 BOS 和 EOS
 
         return torch.tensor(src_ids), torch.tensor(tgt_ids)
 
@@ -66,28 +76,29 @@ class Trainer:
         self.criterion = criterion
         self.device = device
 
-    def train_epoch(self,dataloader:DataLoader):
+    def train_epoch(self, dataloader: DataLoader):
         self.model.train()
-        total_loss=0
+        total_loss = 0
 
-        for src,tgt in dataloader:
-            src=src.to(self.device)
-            tgt=tgt.to(self.device)
-            
-            #目标输入和标签
-            tgt_input=tgt[:, :-1]
-            tgt_label=tgt[:, 1:]
-            
+        for src, tgt in dataloader:
+            src = src.to(self.device)
+            tgt = tgt.to(self.device)
+
+            # 目标输入和标签
+            tgt_input = tgt[:, :-1]
+            tgt_label = tgt[:, 1:]
+
             self.optimizer.zero_grad()
-            output=self.model(src,tgt_input) # [batch_size, tgt_seq_len, vocab_size]
-            
+            output = self.model(src, tgt_input)  # [batch_size, tgt_seq_len, vocab_size]
+
             # output:[batch_size, seq_len, vocab_size] → [batch_size × seq_len, vocab_size], reshape中的-1表示自动计算
-            # 
-            loss=self.criterion(output.reshape(-1,output.size(-1)),tgt_label.reshape(-1))
-            
+            #
+            loss = self.criterion(
+                output.reshape(-1, output.size(-1)), tgt_label.reshape(-1)
+            )
+
             loss.backward()
             self.optimizer.step()
-            total_loss+=loss.item()
-            
-        return total_loss/len(dataloader)
-                    
+            total_loss += loss.item()
+
+        return total_loss / len(dataloader)
