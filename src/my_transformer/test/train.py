@@ -11,7 +11,7 @@ from my_transformer._8_train import TranslationDataset, collate_fn
 
 # ==================== 配置 ====================
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-SAVE_DIR = Path("checkpoints")
+SAVE_DIR = Path("checkpoints/2026-01-12")
 SAVE_DIR.mkdir(exist_ok=True)
 
 # 训练超参数（针对 RTX 3090 24GB 优化）
@@ -24,7 +24,7 @@ DATA_SIZE = 20000  # 减小数据量以加快 BPE 训练（之后可以增加）
 # 模型参数
 EMBED_DIM = 256  # 增大嵌入维度
 NUM_HEADS = 8
-NUM_LAYERS = 4  # 增加层数
+NUM_LAYERS = 6  # 增加层数
 
 # Tokenizer 参数
 VOCAB_SIZE = 2000  # 减小词表以加快 BPE 训练
