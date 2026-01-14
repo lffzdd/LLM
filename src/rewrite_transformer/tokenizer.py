@@ -15,6 +15,7 @@ BPE算法核心思想:
 """
 
 from collections import Counter
+import json
 import re
 
 
@@ -60,6 +61,16 @@ class Vocab:
             self.token_to_id[token] = id
             self.id_to_token[id] = token
 
+    def get_token(self, id: int):
+        if id not in self.id_to_token:
+            return self.UNK_TOKEN
+        return self.id_to_token[id]
+
+    def get_id(self, token: str):
+        if token not in self.token_to_id:
+            return self.token_to_id[self.UNK_TOKEN]
+        return self.token_to_id[token]
+
     def __len__(self):
         """返回词表大小"""
         return len(self.token_to_id)
@@ -93,20 +104,26 @@ class BPETokenizer:
         self.pair_freq = Counter()  # 用于统计相邻pair频率
         self.merge_pair: list[str] = []  # 记录合并顺序，用于后续编码
 
+        self._merge_pair_rank: dict[str, int] = {}
+
     def _tokenize_text(
         self,
         text: str,
         eow: str = "</w>",
         bos: str = Vocab.BOS_TOKEN,
         eos: str = Vocab.EOS_TOKEN,
+        add_bos_eos: bool = False,
     ) -> list[str]:
         """把文本拆分成单词
 
         Args:
-            texts: 文本列表,每个文本是一个字符串
+            text: 文本，每个文本是一个字符串
         """
         # 句首加标识
-        tokens: list[str] = [bos]
+        if add_bos_eos:
+            tokens: list[str] = [bos]
+        else:
+            tokens: list[str] = []
 
         # 遍历['hello','world']
         for word in text.strip().split():  # 'hello world'->['hello','world']
@@ -115,7 +132,8 @@ class BPETokenizer:
             tokens.append(eow)
 
         # [...]->[...,['h','e','l','l','o','</w>','w','o','r','l','d','</w>']]
-        tokens.append(eos)
+        if add_bos_eos:
+            tokens.append(eos)
         return tokens
 
     def _update_pair_freq(self, text: list[str]):
@@ -177,6 +195,11 @@ class BPETokenizer:
             merged_text.append(text[i])
         return merged_text
 
+    def _update_merge_pair_rank(self):
+        self._merge_pair_rank = {
+            pair: index for index, pair in enumerate(self.merge_pair)
+        }
+
     def train(self, texts: list[str], max_vocab_size: int, max_epoch: int):
         """训练BPE分词器
 
@@ -214,7 +237,7 @@ class BPETokenizer:
 
             print(f"第{epoch}轮：\n", self.pair_freq, "\n")
 
-            if len(self.pair_freq) == len(texts_tokens):
+            if len(self.pair_freq) == 0:
                 print("所有text已merge完毕，结束训练")
                 break
 
@@ -223,8 +246,9 @@ class BPETokenizer:
 
             # 4. 根据当前频率最多的pair更新text
             most_pair, _ = self.pair_freq.most_common(1)[0]
-            for i in range(len(texts_tokens)):
-                texts_tokens[i] = self._merge_text(texts_tokens[i], most_pair)
+            texts_tokens = list(
+                map(lambda t: self._merge_text(t, most_pair), texts_tokens)
+            )
 
             # 4. 新pair纳入词表
             self.vocab.add_token(most_pair)
@@ -233,6 +257,8 @@ class BPETokenizer:
             self.pair_freq.clear()
 
             epoch += 1
+
+        self._update_merge_pair_rank()
 
         print(self.vocab.token_to_id)
 
@@ -243,7 +269,66 @@ class BPETokenizer:
             1. vocab.token_to_id - token与id的映射
             2. merge_pair - 合并顺序（用于编码新文本）
         """
-        pass
+        data = {"token_to_id": self.vocab.token_to_id, "merge_pair": self.merge_pair}
+        with open(path, "w") as f:
+            json.dump(data, f, indent=2)
+            print(f"保存到{path}")
+
+    def load(self, path: str):
+        with open(path, "r") as f:
+            data = json.load(f)
+
+        # data["token_to_id"] = dict(
+        #     map(lambda item: (item[0], int(item[1])), data["token_to_id"].items())
+        # )
+
+        self.vocab.token_to_id = data["token_to_id"]
+        self.vocab.id_to_token = {k: v for v, k in self.vocab.token_to_id.items()}
+        self.merge_pair = data["merge_pair"]
+        self._update_merge_pair_rank()
+
+        print(f"已从{path}加载词表")
+
+    def encode(self, text: str):
+        text_tokens = self._tokenize_text(text)
+        # for pair in self.merge_pair:
+        #    text_tokens = self._merge_text(text_tokens, pair)
+
+        while True:
+            min_rank = float("inf")
+            best_pair = None
+
+            for i in range(len(text_tokens) - 1):
+                pair = text_tokens[i] + text_tokens[i + 1]
+
+                if (
+                    pair in self._merge_pair_rank
+                    and self._merge_pair_rank[pair] < min_rank
+                ):
+                    best_pair = pair
+                    min_rank = self._merge_pair_rank[pair]
+
+            if not best_pair:
+                break
+            text_tokens = self._merge_text(text_tokens, best_pair)
+
+        text_ids = list(map(self.vocab.get_id, text_tokens))
+        return text_ids
+
+    def decode(self, text_ids: list[int]):
+        print(text_ids)
+        special_id = (
+            self.vocab.get_id(Vocab.BOS_TOKEN),
+            self.vocab.get_id(Vocab.EOS_TOKEN),
+        )
+        text_tokens = [
+            self.vocab.get_token(id) for id in text_ids if id not in special_id
+        ]
+
+        text = "".join(token for token in text_tokens).replace("</w>", " ")
+
+        print(text)
+        return text
 
 
 if __name__ == "__main__":
@@ -251,3 +336,13 @@ if __name__ == "__main__":
 
     tokenizer = BPETokenizer()
     tokenizer.train(texts, 100, 100)
+
+    tokenizer.save("tokenizer.json")
+    tokenizer.load("tokenizer.json")
+    id1 = tokenizer.encode(texts[0])
+    id2 = tokenizer.encode(texts[1])
+    id3 = tokenizer.encode("fuck you")
+
+    tokenizer.decode(id1)
+    tokenizer.decode(id2)
+    tokenizer.decode(id3)
