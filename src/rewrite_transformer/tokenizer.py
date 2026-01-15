@@ -16,7 +16,10 @@ BPE算法核心思想:
 
 from collections import Counter
 import json
-import re
+import time
+from rewrite_transformer.util import get_logger
+
+logger = get_logger(__name__)
 
 
 class Vocab:
@@ -57,16 +60,18 @@ class Vocab:
         新token的id = 当前词表大小，保证id连续递增
         """
         if token not in self.token_to_id:
-            id = len(self.token_to_id)  # 新id = 当前词表大小
-            self.token_to_id[token] = id
-            self.id_to_token[id] = token
+            idx = len(self.token_to_id)  # 新id = 当前词表大小
+            self.token_to_id[token] = idx
+            self.id_to_token[idx] = token
 
-    def get_token(self, id: int):
-        if id not in self.id_to_token:
+    def get_token(self, token_id: int) -> str:
+        """根据ID获取token，未知ID返回UNK_TOKEN"""
+        if token_id not in self.id_to_token:
             return self.UNK_TOKEN
-        return self.id_to_token[id]
+        return self.id_to_token[token_id]
 
-    def get_id(self, token: str):
+    def get_id(self, token: str) -> int:
+        """根据token获取ID，未知token返回UNK的ID"""
         if token not in self.token_to_id:
             return self.token_to_id[self.UNK_TOKEN]
         return self.token_to_id[token]
@@ -90,6 +95,9 @@ class BPETokenizer:
         3. tokenizer.save(path)  # 保存词表
     """
 
+    # BPE特有的词边界标记，用于区分 "hello" 和 "hell"+"o"
+    EOW_TOKEN = "</w>"
+
     def __init__(self, vocab: Vocab | None = None) -> None:
         """初始化分词器
 
@@ -101,39 +109,49 @@ class BPETokenizer:
         else:
             self.vocab = Vocab()
 
-        self.pair_freq = Counter()  # 用于统计相邻pair频率
-        self.merge_pair: list[str] = []  # 记录合并顺序，用于后续编码
+        # 训练时临时使用，统计相邻pair频率
+        self.pair_freq = Counter()
 
+        # 记录合并顺序，用于后续编码和保存
+        self.merge_pair: list[str] = []
+
+        # merge_pair的字典版本，用于encode时快速查找合并优先级
+        # key: pair, value: 合并顺序（越小优先级越高）
         self._merge_pair_rank: dict[str, int] = {}
 
     def _tokenize_text(
         self,
         text: str,
-        eow: str = "</w>",
         bos: str = Vocab.BOS_TOKEN,
         eos: str = Vocab.EOS_TOKEN,
         add_bos_eos: bool = False,
     ) -> list[str]:
-        """把文本拆分成单词
+        """将文本拆分成字符级token列表
 
         Args:
-            text: 文本，每个文本是一个字符串
+            text: 输入文本，如 "hello world"
+            bos: 句子开始标记
+            eos: 句子结束标记
+            add_bos_eos: 是否添加BOS/EOS标记
+
+        Returns:
+            字符级token列表，如 ['h', 'e', 'l', 'l', 'o', '</w>', 'w', 'o', 'r', 'l', 'd', '</w>']
         """
-        # 句首加标识
+        tokens: list[str] = []
+
+        # 可选：添加句首标记
         if add_bos_eos:
-            tokens: list[str] = [bos]
-        else:
-            tokens: list[str] = []
+            tokens.append(bos)
 
-        # 遍历['hello','world']
-        for word in text.strip().split():  # 'hello world'->['hello','world']
-            # extend会把'hello'迭代加到s，即[...]->[...,'h','e','l','l','o']
-            tokens.extend(word)
-            tokens.append(eow)
+        # 按空格分词，每个词拆成字符 + 词尾标记
+        for word in text.strip().split():
+            tokens.extend(word)  # 'hello' -> ['h', 'e', 'l', 'l', 'o']
+            tokens.append(self.EOW_TOKEN)  # 添加词边界标记
 
-        # [...]->[...,['h','e','l','l','o','</w>','w','o','r','l','d','</w>']]
+        # 可选：添加句尾标记
         if add_bos_eos:
             tokens.append(eos)
+
         return tokens
 
     def _update_pair_freq(self, text: list[str]):
@@ -155,18 +173,14 @@ class BPETokenizer:
             pair = text[i] + text[i + 1]  # 拼接相邻两个token
             self.pair_freq.update([pair])  # Counter.update需要传入可迭代对象
 
-    def _update_merge_pair(self, pair_freq: Counter | None = None):
+    def _update_merge_pair(self, pair: str):
         """记录本轮合并的pair到merge_pair列表
 
         merge_pair列表记录了合并的顺序，用于:
         1. 保存词表时记录BPE合并规则
         2. 加载词表后按相同顺序编码新文本
         """
-        if pair_freq is None:
-            pair_freq = self.pair_freq
-        # most_common(1) 返回 [(pair, count)]，取第一个元素
-        most_pair, freq = pair_freq.most_common(1)[0]
-        self.merge_pair.append(most_pair)
+        self.merge_pair.append(pair)
 
     def _merge_text(self, text: list[str], pair: str):
         """根据pair对文本进行merge
@@ -191,13 +205,14 @@ class BPETokenizer:
                 i += 1
 
         # 如果最后一个没添加，添加最后一个
-        if i != length:
-            merged_text.append(text[i])
+        if i == length - 1:
+            merged_text.append(text[-1])
         return merged_text
 
     def _update_merge_pair_rank(self):
+        """根据merge_pair构建rank字典，用于encode时快速查找合并优先级"""
         self._merge_pair_rank = {
-            pair: index for index, pair in enumerate(self.merge_pair)
+            pair: rank for rank, pair in enumerate(self.merge_pair)
         }
 
     def train(self, texts: list[str], max_vocab_size: int, max_epoch: int):
@@ -213,13 +228,14 @@ class BPETokenizer:
             2. 初始化词表（所有字符）
             3. 循环: 统计pair频率 -> 合并最高频pair -> 更新词表
         """
+
         # ===== 阶段1: 文本预处理 =====
         # 将每个文本拆分成字符级token列表
         texts_tokens: list[list[str]] = []
         for text in texts:
             texts_tokens.append(self._tokenize_text(text))
 
-        print("初始token化文本：\n", texts_tokens, "\n")
+        logger.info("初始token化文本完毕")
 
         # ===== 阶段2: 初始化词表 =====
         # 将所有出现的字符加入词表
@@ -229,78 +245,103 @@ class BPETokenizer:
 
         # ===== 阶段3: 迭代合并 =====
         # 核心循环: 每轮找到最高频pair并合并
+        logger.info("开始训练")
+
         epoch = 0
-        while len(self.vocab) <= max_vocab_size and epoch <= max_epoch:
+        while len(self.vocab) < max_vocab_size and epoch <= max_epoch:
             # 3. 计算pair出现频率
             for text_tokens in texts_tokens:
                 self._update_pair_freq(text_tokens)
 
-            print(f"第{epoch}轮：\n", self.pair_freq, "\n")
+            start_time = time.perf_counter()
+
+            logger.info(f"进入第{epoch}轮,开始时间：{start_time}")
 
             if len(self.pair_freq) == 0:
-                print("所有text已merge完毕，结束训练")
+                logger.info("所有text已merge完毕")
                 break
 
-            # 4. 根据频率更新merge_pair,这里merger_pair没有参与更新，仅仅是用于后续能保存词表
-            self._update_merge_pair()
-
-            # 4. 根据当前频率最多的pair更新text
+            # 4. 获取最高频pair
             most_pair, _ = self.pair_freq.most_common(1)[0]
+
+            # 5. 记录合并历史（用于后续encode和保存）
+            self._update_merge_pair(most_pair)
+
+            # 6. 执行合并：将所有文本中的该pair合并
             texts_tokens = list(
                 map(lambda t: self._merge_text(t, most_pair), texts_tokens)
             )
 
-            # 4. 新pair纳入词表
+            # 7. 新pair加入词表
             self.vocab.add_token(most_pair)
 
-            # 5. 清空pair为下一轮做准备
+            # 8. 清空pair频率统计，为下一轮做准备
             self.pair_freq.clear()
 
             epoch += 1
 
+            end_time = time.perf_counter()
+            logger.info(f"第{epoch}轮训练完毕，耗时{end_time - start_time}秒")
+
         self._update_merge_pair_rank()
 
-        print(self.vocab.token_to_id)
+        logger.info("训练完毕")
 
     def save(self, path: str):
-        """保存词表到文件
+        """保存tokenizer到JSON文件
 
-        TODO: 实现保存逻辑，需要保存:
-            1. vocab.token_to_id - token与id的映射
-            2. merge_pair - 合并顺序（用于编码新文本）
+        保存内容:
+            - token_to_id: token与id的映射
+            - merge_pair: 合并顺序（encode时按此顺序合并）
         """
         data = {"token_to_id": self.vocab.token_to_id, "merge_pair": self.merge_pair}
-        with open(path, "w") as f:
-            json.dump(data, f, indent=2)
-            print(f"保存到{path}")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+
+        logger.info(f"训练结果保存到{path}")
 
     def load(self, path: str):
-        with open(path, "r") as f:
+        """从JSON文件加载tokenizer
+
+        Args:
+            path: tokenizer文件路径
+        """
+        with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
 
-        # data["token_to_id"] = dict(
-        #     map(lambda item: (item[0], int(item[1])), data["token_to_id"].items())
-        # )
-
+        # 恢复词表的双向映射
         self.vocab.token_to_id = data["token_to_id"]
-        self.vocab.id_to_token = {k: v for v, k in self.vocab.token_to_id.items()}
+        self.vocab.id_to_token = {
+            token_id: token for token, token_id in self.vocab.token_to_id.items()
+        }
+
+        # 恢复合并历史和rank缓存
         self.merge_pair = data["merge_pair"]
         self._update_merge_pair_rank()
 
-        print(f"已从{path}加载词表")
+        logger.info(f"已从{path}加载词表")
 
-    def encode(self, text: str):
-        text_tokens = self._tokenize_text(text)
-        # for pair in self.merge_pair:
-        #    text_tokens = self._merge_text(text_tokens, pair)
+    def encode(self, text: str, add_special_tokens: bool = False) -> list[int]:
+        """将文本编码为token ID列表
 
+        Args:
+            text: 输入文本
+            add_special_tokens: 是否添加BOS/EOS标记
+
+        Returns:
+            token ID列表
+        """
+        # 1. 文本 -> 字符级token列表
+        text_tokens = self._tokenize_text(text, add_bos_eos=add_special_tokens)
+
+        # 2. 按训练时的合并顺序，依次合并存在的pair
         while True:
+            # 找到当前文本中存在的、rank最小的pair
             min_rank = float("inf")
             best_pair = None
 
             for i in range(len(text_tokens) - 1):
                 pair = text_tokens[i] + text_tokens[i + 1]
-
                 if (
                     pair in self._merge_pair_rank
                     and self._merge_pair_rank[pair] < min_rank
@@ -308,27 +349,42 @@ class BPETokenizer:
                     best_pair = pair
                     min_rank = self._merge_pair_rank[pair]
 
+            # 没有可合并的pair，结束
             if not best_pair:
                 break
+
             text_tokens = self._merge_text(text_tokens, best_pair)
 
+        # 3. token -> ID
         text_ids = list(map(self.vocab.get_id, text_tokens))
         return text_ids
 
-    def decode(self, text_ids: list[int]):
-        print(text_ids)
-        special_id = (
+    def decode(self, text_ids: list[int]) -> str:
+        """将token ID列表解码为文本
+
+        Args:
+            text_ids: token ID列表
+
+        Returns:
+            解码后的文本
+        """
+        # 需要过滤掉的特殊token ID
+        special_ids = {
             self.vocab.get_id(Vocab.BOS_TOKEN),
             self.vocab.get_id(Vocab.EOS_TOKEN),
-        )
+        }
+
+        # ID -> token，同时过滤特殊token
         text_tokens = [
-            self.vocab.get_token(id) for id in text_ids if id not in special_id
+            self.vocab.get_token(token_id)
+            for token_id in text_ids
+            if token_id not in special_ids
         ]
 
-        text = "".join(token for token in text_tokens).replace("</w>", " ")
+        # 拼接并将词边界标记还原为空格
+        text = "".join(text_tokens).replace(self.EOW_TOKEN, " ")
 
-        print(text)
-        return text
+        return text.strip()
 
 
 if __name__ == "__main__":
