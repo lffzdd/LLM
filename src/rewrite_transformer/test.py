@@ -1,5 +1,7 @@
-from rewrite_transformer.tokenizer import BPETokenizer
+from rewrite_transformer.tokenizer import BPETokenizer, Vocab
 from rewrite_transformer.util import load_dataset
+from rewrite_transformer.embedding import TokenEmbedding
+from rewrite_transformer.attention import SelfMultiHeadAttention,create_scores_mask
 
 import time
 
@@ -45,6 +47,59 @@ def test_train_bpe():
     print("耗时：", end - start)
 
 
+def test_token_embedding():
+    import torch
+
+    tokenizer = BPETokenizer()
+    tokenizer.load("./tokenizer.json")
+
+    texts = ["hello world", "fuck you"]
+    texts_ids = tokenizer.encode(texts,padding=True)
+
+    print("原始 texts_ids:", texts_ids)
+
+    # Padding: 把短序列补齐到最长序列的长度
+    # 使用 PAD token id (假设是 0，或者你可以从 tokenizer 获取)
+    # pad_id = tokenizer.vocab.get_id(Vocab.PAD_TOKEN)
+    # max_len = max(len(ids) for ids in texts_ids)
+
+    # padded_ids = []
+    # for ids in texts_ids:
+    #     padded = ids + [pad_id] * (max_len - len(ids))
+    #     padded_ids.append(padded)
+
+
+    # 转换为 tensor: shape = (batch_size, seq_len)
+    # input_tensor = torch.tensor(padded_ids)
+    # print("Input tensor shape:", input_tensor.shape)
+
+    embedding = TokenEmbedding(tokenizer.vocab_size, 30)
+    vecs = embedding.forward(texts_ids)
+
+    # 输出 shape 应该是 (batch_size, seq_len, embed_dim)
+    print("Output shape:", vecs.shape)
+    print("Embedding vectors:\n", vecs)
+
+def test_attention():
+    import torch
+
+    tokenizer = BPETokenizer()
+    tokenizer.load("./tokenizer.json")
+
+    texts = ["hello world", "fuck you"]
+    texts_ids = tokenizer.encode(texts,padding=True)
+    texts_ids = torch.tensor(texts_ids)
+
+    embedding = TokenEmbedding(tokenizer.vocab_size, 32)
+    vecs = embedding.forward(texts_ids)
+
+    attention = SelfMultiHeadAttention(32, 8, 4)
+    mask = create_scores_mask(vecs.shape[1], vecs.device)
+    output = attention.forward(vecs, mask)
+
+    print("Output shape:", output.shape)
+    print("Output vectors:\n", output)
+        
 if __name__ == "__main__":
     # test_tokenizer()
-    test_train_bpe()
+    test_attention()

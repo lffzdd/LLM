@@ -321,43 +321,86 @@ class BPETokenizer:
 
         logger.info(f"已从{path}加载词表")
 
-    def encode(self, text: str, add_special_tokens: bool = False) -> list[int]:
+    def encode(
+        self,
+        texts: list[str] | str,
+        add_special_tokens: bool = False,
+        padding: bool = False,
+        padded_len: int | None = None,
+        truncation: bool = False,
+    ) -> list[int]:
         """将文本编码为token ID列表
 
         Args:
             text: 输入文本
             add_special_tokens: 是否添加BOS/EOS标记
+            padding: 是否进行padding
+            padded_len: padding后的长度，如果不指定，则为所有文本中最长序列的长度
+            truncation: 若padding后的长度超过max_len，则截断到max_len
 
         Returns:
             token ID列表
         """
-        # 1. 文本 -> 字符级token列表
-        text_tokens = self._tokenize_text(text, add_bos_eos=add_special_tokens)
+        if isinstance(texts, str):
+            texts = [texts]
 
-        # 2. 按训练时的合并顺序，依次合并存在的pair
-        while True:
-            # 找到当前文本中存在的、rank最小的pair
-            min_rank = float("inf")
-            best_pair = None
+        texts_ids: list[list[int]] = []
 
-            for i in range(len(text_tokens) - 1):
-                pair = text_tokens[i] + text_tokens[i + 1]
-                if (
-                    pair in self._merge_pair_rank
-                    and self._merge_pair_rank[pair] < min_rank
-                ):
-                    best_pair = pair
-                    min_rank = self._merge_pair_rank[pair]
+        max_len = 0  # 记录最长序列长度
+        for text in texts:
+            # 1. 文本 -> 字符级token列表
+            text_tokens = self._tokenize_text(text, add_bos_eos=add_special_tokens)
 
-            # 没有可合并的pair，结束
-            if not best_pair:
-                break
+            # 2. 按训练时的合并顺序，依次合并存在的pair
+            while True:
+                # 找到当前文本中存在的、rank最小的pair
+                min_rank = float("inf")
+                best_pair = None
 
-            text_tokens = self._merge_text(text_tokens, best_pair)
+                for i in range(len(text_tokens) - 1):
+                    pair = text_tokens[i] + text_tokens[i + 1]
+                    if (
+                        pair in self._merge_pair_rank
+                        and self._merge_pair_rank[pair] < min_rank
+                    ):
+                        best_pair = pair
+                        min_rank = self._merge_pair_rank[pair]
 
-        # 3. token -> ID
-        text_ids = list(map(self.vocab.get_id, text_tokens))
-        return text_ids
+                # 没有可合并的pair，结束
+                if not best_pair:
+                    break
+
+                text_tokens = self._merge_text(text_tokens, best_pair)
+
+            # 3. token -> ID
+            text_ids = list(map(self.vocab.get_id, text_tokens))
+
+            texts_ids.append(text_ids)
+            if not padded_len and len(text_ids) > max_len:
+                max_len = len(text_ids)
+
+        # 统一 padding（在所有文本编码完成后）
+        if padded_len:
+            max_len = padded_len
+
+        if (padding or padded_len) and len(texts_ids) > 1:
+            pad_id = self.vocab.get_id(Vocab.PAD_TOKEN)
+            for i, ids in enumerate(texts_ids):
+                pad_cnt = max_len - len(ids)
+                if pad_cnt < 0:
+                    if truncation:
+                        del ids[:max_len]
+                    else:
+                        raise ValueError(
+                            f"序列 {i} 的长度 ({len(ids)}) 超过了 padded_len ({max_len})"
+                        )
+                if pad_cnt > 0:
+                    ids.extend([pad_id] * pad_cnt)
+
+        if isinstance(texts, str):
+            return texts_ids[0]
+
+        return texts_ids
 
     def decode(self, text_ids: list[int]) -> str:
         """将token ID列表解码为文本
@@ -385,6 +428,10 @@ class BPETokenizer:
         text = "".join(text_tokens).replace(self.EOW_TOKEN, " ")
 
         return text.strip()
+
+    @property
+    def vocab_size(self):
+        return len(self.vocab)
 
 
 if __name__ == "__main__":
