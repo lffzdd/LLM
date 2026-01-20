@@ -1,0 +1,3 @@
+[submodule "src/huggingface/tokenizers"]
+	path = src/huggingface/tokenizers
+	url = git@github.com:huggingface/tokenizers.git
