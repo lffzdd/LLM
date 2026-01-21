@@ -1,7 +1,9 @@
+import torch
 from rewrite_transformer.tokenizer import BPETokenizer, Vocab
 from rewrite_transformer.util import load_dataset
 from rewrite_transformer.embedding import TokenEmbedding
-from rewrite_transformer.attention import SelfMultiHeadAttention,create_scores_mask
+from rewrite_transformer.attention import SelfMultiHeadAttention, create_causal_mask
+from rewrite_transformer.transformer import Transformer
 
 import time
 
@@ -48,13 +50,11 @@ def test_train_bpe():
 
 
 def test_token_embedding():
-    import torch
-
     tokenizer = BPETokenizer()
     tokenizer.load("./tokenizer.json")
 
     texts = ["hello world", "fuck you"]
-    texts_ids = tokenizer.encode(texts,padding=True)
+    texts_ids = tokenizer.encode(texts, padding=True)
 
     print("原始 texts_ids:", texts_ids)
 
@@ -68,7 +68,6 @@ def test_token_embedding():
     #     padded = ids + [pad_id] * (max_len - len(ids))
     #     padded_ids.append(padded)
 
-
     # 转换为 tensor: shape = (batch_size, seq_len)
     # input_tensor = torch.tensor(padded_ids)
     # print("Input tensor shape:", input_tensor.shape)
@@ -80,26 +79,52 @@ def test_token_embedding():
     print("Output shape:", vecs.shape)
     print("Embedding vectors:\n", vecs)
 
-def test_attention():
-    import torch
 
+def test_attention():
     tokenizer = BPETokenizer()
     tokenizer.load("./tokenizer.json")
 
     texts = ["hello world", "fuck you"]
-    texts_ids = tokenizer.encode(texts,padding=True)
+    texts_ids = tokenizer.encode(texts, padding=True)
     texts_ids = torch.tensor(texts_ids)
 
     embedding = TokenEmbedding(tokenizer.vocab_size, 32)
     vecs = embedding.forward(texts_ids)
 
     attention = SelfMultiHeadAttention(32, 8, 4)
-    mask = create_scores_mask(vecs.shape[1], vecs.device)
+    mask = create_causal_mask(vecs.shape[1], vecs.device)
     output = attention.forward(vecs, mask)
 
     print("Output shape:", output.shape)
     print("Output vectors:\n", output)
-        
+
+
+def test_transformer():
+    tokenizer = BPETokenizer()
+    tokenizer.load("./tokenizer.json")
+
+    texts = ["hello world", "fuck you"]
+    texts_ids = tokenizer.encode(texts, padding=True)
+    texts_ids = torch.tensor(texts_ids)
+
+    vocab_size = tokenizer.vocab_size
+
+    transformer = Transformer(
+        tgt_vocab_size=vocab_size,
+        src_vocab_size=vocab_size,
+        embed_dim=32,
+        head_dim=4,
+        head_num=8,
+        max_seq_len=32,
+        pad_id=tokenizer.vocab.get_id(Vocab.PAD_TOKEN),
+    )
+
+    output = transformer.forward(texts_ids, texts_ids)
+    print("Output shape:", output.shape)
+    print("Output vectors:\n", output)
+
+
 if __name__ == "__main__":
     # test_tokenizer()
-    test_attention()
+    # test_attention()
+    test_transformer()

@@ -389,7 +389,7 @@ class BPETokenizer:
                 pad_cnt = max_len - len(ids)
                 if pad_cnt < 0:
                     if truncation:
-                        del ids[:max_len]
+                        del ids[max_len:]
                     else:
                         raise ValueError(
                             f"序列 {i} 的长度 ({len(ids)}) 超过了 padded_len ({max_len})"
