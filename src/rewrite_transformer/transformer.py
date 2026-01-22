@@ -17,7 +17,7 @@ class Transformer(nn.Module):
         head_dim,
         head_num,
         encoder_layer_num: int = 6,
-        decoder_layer_num: int = 8,
+        decoder_layer_num: int = 6,
         pad_id: int = 0,
     ):
         super().__init__()
@@ -40,7 +40,7 @@ class Transformer(nn.Module):
             decoder_layer_num,
         )
 
-        self.output_later = nn.Linear(embed_dim, tgt_vocab_size)
+        self.output_layer = nn.Linear(embed_dim, tgt_vocab_size)
 
     def forward(self, src_seq: Tensor, tgt_seq: Tensor):
         src_padding_mask = create_padding_mask(src_seq, self.pad_id)
@@ -55,6 +55,6 @@ class Transformer(nn.Module):
             tgt_seq, encoder_output, tgt_padding_mask, tgt_casual_mask, src_padding_mask
         )
 
-        output = self.output_later(tgt_output)
+        output = self.output_layer(tgt_output)
 
         return output

@@ -143,7 +143,7 @@ class CrossMultiHeadAttention(nn.Module):
         return output
 
 
-def create_causal_mask(seq_len: int, device: str = None) -> Tensor:
+def create_causal_mask(seq_len: int, device: str| None = None) -> Tensor:
     """创建因果掩码（Causal Mask），用于 Decoder 自注意力
         防止位置 i 看到位置 i+1, i+2, ... 的信息
 

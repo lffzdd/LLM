@@ -7,19 +7,23 @@ from rewrite_transformer.transformer import Transformer
 
 import time
 
+from rewrite_transformer.util import get_logger
+logger = get_logger(__name__)
 
-def test_tokenizer():
+def test_train_tokenizer():
+    logger.info("Testing BPE Tokenizer training...")
+    
     tokenizer = BPETokenizer()
 
     texts = ["hello world", "how are you"]
 
     tokenizer.train(texts, 100, max_epoch=100)
 
-    text_ids = tokenizer.encode("fuck you")
-    print(text_ids)
+    text_ids = tokenizer.encode("fuck you",add_special_tokens=True)
+    logger.info(f"Encoded text IDs: {text_ids}")
 
     text = tokenizer.decode(text_ids)
-
+    logger.info(f"Decoded text: {text}")
 
 def test_load_dataset():
     en_path = "../dataset/TED2020.en-zh_cn.en"
@@ -123,8 +127,20 @@ def test_transformer():
     print("Output shape:", output.shape)
     print("Output vectors:\n", output)
 
+def test_trainTransformer():
+    from rewrite_transformer.train import trainTransformer
+
+    trainTransformer(
+        bpe_src_path="../huggingface/en_tokenizer.json",
+        bpe_tgt_path="../huggingface/cn_tokenizer.json",
+        data_path="../dataset/TED2020.en-zh_cn.en",
+        labels_path="../dataset/TED2020.en-zh_cn.zh_cn",
+        num_epochs=3,
+        use_official_tokenizer=True,
+    )
 
 if __name__ == "__main__":
-    # test_tokenizer()
+    # test_train_tokenizer()
+    test_trainTransformer()
     # test_attention()
-    test_transformer()
+    # test_transformer()

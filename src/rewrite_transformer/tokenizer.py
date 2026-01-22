@@ -42,6 +42,11 @@ class Vocab:
     BOS_TOKEN = "<BOS>"
     EOS_TOKEN = "<EOS>"
 
+    PAD_ID = 0
+    UNK_ID = 1
+    BOS_ID = 2
+    EOS_ID = 3
+
     def __init__(self) -> None:
         """初始化词表，预置4个特殊token"""
         # 特殊token的id固定为0-3，保证不同训练结果的一致性
@@ -328,7 +333,7 @@ class BPETokenizer:
         padding: bool = False,
         padded_len: int | None = None,
         truncation: bool = False,
-    ) -> list[int]:
+    ) -> list[int] | list[list[int]]:
         """将文本编码为token ID列表
 
         Args:
@@ -402,7 +407,7 @@ class BPETokenizer:
 
         return texts_ids
 
-    def decode(self, text_ids: list[int]) -> str:
+    def decode(self, text_ids: list[int] | list[list[int]]) -> str | list[str]:
         """将token ID列表解码为文本
 
         Args:
@@ -417,35 +422,25 @@ class BPETokenizer:
             self.vocab.get_id(Vocab.EOS_TOKEN),
         }
 
-        # ID -> token，同时过滤特殊token
-        text_tokens = [
-            self.vocab.get_token(token_id)
-            for token_id in text_ids
-            if token_id not in special_ids
-        ]
+        if not isinstance(text_ids[0], list):
+            text_ids = [text_ids]
 
-        # 拼接并将词边界标记还原为空格
-        text = "".join(text_tokens).replace(self.EOW_TOKEN, " ")
+        texts: list[str] = []
+        for text_id in text_ids:
+            # ID -> token，同时过滤特殊token
+            text_tokens = [
+                self.vocab.get_token(token_id)
+                for token_id in text_id
+                if token_id not in special_ids
+            ]
 
-        return text.strip()
+            texts.append("".join(text_tokens))
+
+        # 拼接并将词边界标记还原为空格,strip去除首尾空格
+        texts = ["".join(text).replace(self.EOW_TOKEN, " ").strip() for text in texts]
+
+        return texts
 
     @property
     def vocab_size(self):
         return len(self.vocab)
-
-
-if __name__ == "__main__":
-    texts = ["hello world", "how are you"]
-
-    tokenizer = BPETokenizer()
-    tokenizer.train(texts, 100, 100)
-
-    tokenizer.save("tokenizer.json")
-    tokenizer.load("tokenizer.json")
-    id1 = tokenizer.encode(texts[0])
-    id2 = tokenizer.encode(texts[1])
-    id3 = tokenizer.encode("fuck you")
-
-    tokenizer.decode(id1)
-    tokenizer.decode(id2)
-    tokenizer.decode(id3)

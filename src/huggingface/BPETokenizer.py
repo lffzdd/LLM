@@ -1,3 +1,4 @@
+from numpy import add
 from tokenizers import Tokenizer
 from tokenizers.models import BPE
 from tokenizers.trainers import BpeTrainer
@@ -33,10 +34,21 @@ def train():
 
 
 def eval():
-    tokenizer = Tokenizer.from_file("./en_tokenizer.json")
+    from tokenizers.processors import TemplateProcessing
 
-    output = tokenizer.encode("fuckyourgaylao@~￥")
+    tokenizer = Tokenizer.from_file("./cn_tokenizer.json")
+    tokenizer.post_processor = TemplateProcessing(
+        single="<BOS> $A <EOS>",
+        pair="<BOS> $A <EOS> <BOS> $B <EOS>",
+        special_tokens=[
+            ("<BOS>", tokenizer.token_to_id("<BOS>")),
+            ("<EOS>", tokenizer.token_to_id("<EOS>")), 
+        ]
+    )
 
+    output = tokenizer.encode("简直是个傻逼",add_special_tokens=True)
+
+    print(output)
     print(output.tokens)  # ['hello', '</w>', 'world', '</w>']
     print(output.ids)  # [123, 456, 789, 456]
 
