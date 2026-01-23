@@ -38,5 +38,6 @@ Thumbs.db
 
 # model files
 *.pt
+*.pth
 
 .history/

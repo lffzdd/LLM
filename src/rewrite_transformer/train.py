@@ -65,8 +65,23 @@ def trainTransformer(
     labels_path,
     num_epochs: int = 50,
     use_official_tokenizer=False,
+    resume_training=False,
+    model_save_path="transformer_model.pth",
 ):
+    """训练Transformer模型
+
+    Args:
+        bpe_src_path (str): 源语言的BPE词表文件路径
+        bpe_tgt_path (str): 目标语言的BPE词表文件路径
+        data_path (str): 源语言的语料文件路径
+        labels_path (str): 目标语言的语料文件路径
+        num_epochs (int, optional): 训练轮数. Defaults to 50.
+        use_official_tokenizer (bool, optional): 是否使用官方tokenizer. Defaults to False.
+        resume_training (bool, optional): 是否断点续训. Defaults to False.
+        model_save_path (str, optional): 模型保存路径. Defaults to "transformer_model.pth".
+    """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    torch.cuda.set_per_process_memory_fraction(0.95, device=0)
 
     # tokenizer需要的是词表文件，dataset需要的是语料文件
     if use_official_tokenizer:
@@ -84,7 +99,15 @@ def trainTransformer(
     tgt_batch = load_dataset(labels_path)
 
     dataset = TransformerDataset(src_batch, tgt_batch, src_tokenizer, tgt_tokenizer)
-    data_loader = DataLoader(dataset, batch_size=256, collate_fn=collate_fn)
+    data_loader = DataLoader(
+        dataset,
+        batch_size=32,
+        collate_fn=collate_fn,
+        num_workers=0,
+        pin_memory=True,
+        # persistent_workers=True,  # 保持worker进程存活，避免重复创建
+        # prefetch_factor=2,  # 每个worker预取2个batch
+    )
 
     model = Transformer(
         src_vocab_size=src_vocab_size,
@@ -94,13 +117,22 @@ def trainTransformer(
         head_dim=512 // 8,
         head_num=8,
     )
+
+    if resume_training:
+        model.load_state_dict(torch.load(model_save_path))
+
     model.to(device)
 
     criterion = nn.CrossEntropyLoss(ignore_index=Vocab.PAD_ID)
     optimizer = torch.optim.AdamW(model.parameters(), lr=0.001)
 
-    scaler = torch.cuda.amp.GradScaler()
+    # 混合精度训练
+    scaler = torch.amp.GradScaler(device="cuda")
 
+    # early stopping
+    best_loss = float("inf")
+    patience = 2
+    no_improve = 0
     from tqdm import trange, tqdm
 
     for epoch in trange(num_epochs, desc="Epoch"):
@@ -137,14 +169,33 @@ def trainTransformer(
 
             # 第一个 batch 后打印显存占用
             if epoch == 0 and pbar.n == 1:
+                allocated = torch.cuda.memory_allocated() / 1024**3
+                reserved = torch.cuda.memory_reserved() / 1024**3
+                max_allocated = torch.cuda.max_memory_allocated() / 1024**3
                 print(
-                    f"显存占用: {torch.cuda.memory_allocated() / 1024**3:.2f} GB / "
-                    f"显存峰值: {torch.cuda.max_memory_allocated() / 1024**3:.2f} GB"
+                    f"\n[GPU 显存] 已分配: {allocated:.2f} GB / "
+                    f"已预留: {reserved:.2f} GB / 峰值: {max_allocated:.2f} GB"
                 )
+
+                if max_allocated > 20:
+                    print(
+                        "⚠️ 警告：显存使用超过 20 GB，可能使用了共享内存（很慢）！减小 batch_size"
+                    )
 
         avg_train_loss = (
             train_loss / len(data_loader)
         )  # len(data_loader)即为batch数量,会调用__len__方法，dataset的__len__方法返回样本数量/batch_size
+
+        # early stopping
+        if avg_train_loss < best_loss:
+            best_loss = train_loss
+
+            no_improve += 1
+            if no_improve >= patience:
+                torch.save(model.state_dict(), "best_model.pth")
+                logger.info(f"Model saved to best_model.pth\tepoch: {epoch}")
+                no_improve = 0
+
         logger.info(f"Epoch [{epoch + 1}/{num_epochs}], Loss: {avg_train_loss:.4f}")
 
     torch.save(model.state_dict(), "transformer_model.pth")

@@ -1,5 +1,3 @@
-from encodings import search_function
-from httpx import get
 from torch.utils.data import Dataset
 import torch
 
@@ -61,5 +59,20 @@ def collate_fn(
     padded_src = [ids + [pad_id] * (src_max_len - len(ids)) for ids in src_batch]
     padded_tgt = [ids + [pad_id] * (tgt_max_len - len(ids)) for ids in tgt_batch]
 
-    # logger.info(f"padded_src的类型:{type(padded_src)}", f"padded_src打印:{padded_src}")
+    # 临时：打印一次 seq_len 用于诊断
+    if not hasattr(collate_fn, "_printed"):
+        print(f"[诊断] src_seq_len={src_max_len}, tgt_seq_len={tgt_max_len}")
+        collate_fn._printed = True
+
+    # max_len = 256
+
+    # # 先截断，再 padding
+    # def truncate_and_pad(ids):
+    #     ids = ids[:max_len]  # 截断到 max_len
+    #     ids = ids + [Vocab.PAD_ID] * (max_len - len(ids))  # padding 到 max_len
+    #     return ids
+
+    # padded_src = [truncate_and_pad(ids) for ids in src_batch]
+    # padded_tgt = [truncate_and_pad(ids) for ids in tgt_batch]
+
     return torch.tensor(padded_src), torch.tensor(padded_tgt)
