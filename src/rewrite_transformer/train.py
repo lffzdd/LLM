@@ -188,13 +188,15 @@ def trainTransformer(
 
         # early stopping
         if avg_train_loss < best_loss:
-            best_loss = train_loss
-
+            best_loss = avg_train_loss
+            no_improve = 0
+            torch.save(model.state_dict(), "best_model.pth")
+            logger.info(f"Best model saved to best_model.pth\tepoch: {epoch}")
+        else:
             no_improve += 1
             if no_improve >= patience:
-                torch.save(model.state_dict(), "best_model.pth")
-                logger.info(f"Model saved to best_model.pth\tepoch: {epoch}")
-                no_improve = 0
+                logger.info(f"Early stopping at epoch {epoch}")
+                break
 
         logger.info(f"Epoch [{epoch + 1}/{num_epochs}], Loss: {avg_train_loss:.4f}")
 
