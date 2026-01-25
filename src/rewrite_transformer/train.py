@@ -81,7 +81,7 @@ def trainTransformer(
         model_save_path (str, optional): 模型保存路径. Defaults to "transformer_model.pth".
     """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    torch.cuda.set_per_process_memory_fraction(0.95, device=0)
+    # torch.cuda.set_per_process_memory_fraction(0.95, device=0)
 
     # tokenizer需要的是词表文件，dataset需要的是语料文件
     if use_official_tokenizer:
@@ -131,7 +131,7 @@ def trainTransformer(
 
     # early stopping
     best_loss = float("inf")
-    patience = 2
+    patience = 3
     no_improve = 0
     from tqdm import trange, tqdm
 
