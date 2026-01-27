@@ -24,10 +24,12 @@ class EncoderLayer(nn.Module):
     def forward(self, x: Tensor, src_padding_mask: Tensor | None = None):
         """Encoder阶段，自注意力不需要因果掩码，只需要针对源序列的填充掩码"""
         attn_output = self.self_attn(x, src_padding_mask)
-        x = self.norm1(x + self.dropout(attn_output))
+        # x = self.norm1(x + self.dropout(attn_output))
+        # Pre-LN:Transformer 原文把LayerNorm放在了残差连接之后，在这个过程中，梯度会被反复缩放，后来发现把LayerNorm放在残差连接之前效果更好
+        x = x + self.norm1(self.dropout(attn_output))
 
         ff_output = self.feed_forward(x)
-        x = self.norm2(x + self.dropout(ff_output))
+        x = x + self.norm2(self.dropout(ff_output))
 
         return x
 

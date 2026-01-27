@@ -1,3 +1,4 @@
+import math
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
@@ -124,7 +125,26 @@ def trainTransformer(
     model.to(device)
 
     criterion = nn.CrossEntropyLoss(ignore_index=Vocab.PAD_ID)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=0.001)
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=1e-4, betas=(0.9, 0.98), eps=1e-9
+    )
+
+    # 学习率调度器 - warmup + cosine decay
+    warmup_steps = 4000
+    total_steps = num_epochs * len(data_loader)
+
+    def lr_lambda(step):
+        if step == 0:
+            return 1e-8  # 避免除零
+        # Warmup 阶段
+        if step < warmup_steps:
+            return step / warmup_steps
+        # Cosine decay 阶段
+        return 0.5 * (
+            1 + math.cos(math.pi * (step - warmup_steps) / (total_steps - warmup_steps))
+        )
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
     # 混合精度训练
     scaler = torch.amp.GradScaler(device="cuda")
@@ -158,8 +178,14 @@ def trainTransformer(
 
             optimizer.zero_grad()
             scaler.scale(loss).backward()
+
+            # 梯度裁剪 - 防止梯度爆炸导致 NaN
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
             scaler.step(optimizer)
             scaler.update()
+            scheduler.step()  # 更新学习率
 
             train_loss += loss.item()
 

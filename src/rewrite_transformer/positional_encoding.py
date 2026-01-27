@@ -1,6 +1,7 @@
 import torch.nn as nn
 import torch
-from torch import Tensor, embedding
+import math
+from torch import Tensor
 
 
 class PositionalEncoder(nn.Module):
@@ -15,14 +16,18 @@ class PositionalEncoder(nn.Module):
         pos_vec = torch.zeros(self.max_seq_len, self.embed_dim)
 
         # [max_seq_len, 1] - 增加维度以便广播
-        pos = torch.arange(self.max_seq_len).unsqueeze(1)
+        pos = torch.arange(self.max_seq_len).unsqueeze(1).float()
 
-        # [embed_dim/2]
-        div_term = 10000 ** (torch.arange(0, self.embed_dim, 2) / self.embed_dim)
+        # [embed_dim/2] - 使用 log 空间计算，避免数值溢出
+        div_term = torch.exp(
+            torch.arange(0, self.embed_dim, 2).float()
+            * -(math.log(10000.0) / self.embed_dim)
+        )
 
-        # pos / div_term 广播: [max_seq_len, 1] / [embed_dim/2] -> [max_seq_len, embed_dim/2]
-        pos_vec[:, 0::2] = torch.sin(pos / div_term)
-        pos_vec[:, 1::2] = torch.cos(pos / div_term)
+        # pos * div_term 广播: [max_seq_len, 1] * [embed_dim/2] -> [max_seq_len, embed_dim/2]
+        # 注意：新的 div_term = 1 / (10000^(2i/d))，所以用乘法
+        pos_vec[:, 0::2] = torch.sin(pos * div_term)
+        pos_vec[:, 1::2] = torch.cos(pos * div_term)
         return pos_vec
 
     def forward(self, x: Tensor):

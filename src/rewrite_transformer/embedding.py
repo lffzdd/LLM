@@ -10,3 +10,5 @@ class TokenEmbedding(nn.Module):
 
     def forward(self, x: Tensor):
         return self.w[x]
+
+nn.Transformer
