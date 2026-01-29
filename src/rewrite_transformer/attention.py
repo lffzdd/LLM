@@ -55,7 +55,7 @@ class SelfMultiHeadAttention(nn.Module):
         # 若为组合掩码：mask[batch_size,1,seq_len,seq_len]
         # 若为填充掩码：mask[batch_size,1,  1,    seq_len]
         if mask is not None:
-            scores = scores.masked_fill(mask, -1e4)
+            scores = scores.masked_fill(mask, float("-inf"))
 
         scores = scores.softmax(-1)
         scores = self.dropout(scores)  # dropout 应用于 attention weights
@@ -125,7 +125,7 @@ class CrossMultiHeadAttention(nn.Module):
         scores: Tensor = q @ k.transpose(-1, -2) / self.scale
 
         if padding_mask is not None:
-            scores = scores.masked_fill(padding_mask, -1e4)
+            scores = scores.masked_fill(padding_mask, float("-inf"))
 
         scores = scores.softmax(-1)
         scores = self.dropout(scores)  # dropout 应用于 attention weights
@@ -143,7 +143,7 @@ class CrossMultiHeadAttention(nn.Module):
         return output
 
 
-def create_causal_mask(seq_len: int, device: str| None = None) -> Tensor:
+def create_causal_mask(seq_len: int, device: str | None = None) -> Tensor:
     """创建因果掩码（Causal Mask），用于 Decoder 自注意力
         防止位置 i 看到位置 i+1, i+2, ... 的信息
 
