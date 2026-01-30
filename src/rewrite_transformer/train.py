@@ -120,6 +120,7 @@ def trainTransformer(
     )
 
     if resume_training:
+        logger.info(f"Resuming training from {model_save_path}")
         model.load_state_dict(torch.load(model_save_path))
 
     model.to(device)
@@ -208,8 +209,8 @@ def trainTransformer(
                         "⚠️ 警告：显存使用超过 20 GB，可能使用了共享内存（很慢）！减小 batch_size"
                     )
 
-        avg_train_loss = (
-            train_loss / len(data_loader)
+        avg_train_loss = train_loss / len(
+            data_loader
         )  # len(data_loader)即为batch数量,会调用__len__方法，dataset的__len__方法返回样本数量/batch_size
 
         # early stopping

@@ -139,8 +139,9 @@ def test_trainTransformer():
         bpe_tgt_path="../huggingface/cn_tokenizer.json",
         data_path="../dataset/TED2020.en-zh_cn.en",
         labels_path="../dataset/TED2020.en-zh_cn.zh_cn",
-        num_epochs=100,
+        num_epochs=50,
         use_official_tokenizer=True,
+        resume_training=True
     )
 
 
