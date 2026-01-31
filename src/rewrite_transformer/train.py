@@ -278,7 +278,12 @@ def generate(
         encoded = src_tokenizer.encode(text, add_special_tokens=True).ids
         encoded_ids.append(encoded)
 
-    src_seq = torch.tensor(encoded_ids).to(device)
+    # tensor方法对不同长度的序列无法直接转换，需要padding成相同长度
+    pad_id = src_tokenizer.token_to_id("<PAD>")
+    max_len = max(len(ids) for ids in encoded_ids) if encoded_ids else 0
+    padded_ids = [ids + [pad_id] * (max_len - len(ids)) for ids in encoded_ids]
+
+    src_seq = torch.tensor(padded_ids).to(device)
 
     with torch.no_grad():
         outputs = model.generate(
@@ -289,8 +294,13 @@ def generate(
         )
         outputs=outputs.tolist()
 
-    for i, output_ids in enumerate(outputs):
-        output_text = tgt_tokenizer.decode(output_ids)
-        print(f"Input: {texts[i]}")
-        print(f"Output: {output_text}")
-        print()
+    # 截断到 <EOS>，去掉 EOS 之后的垃圾 token
+    eos_id = tgt_tokenizer.token_to_id("<EOS>")
+    truncated_outputs = []
+    for output_ids in outputs:
+        if eos_id in output_ids:
+            output_ids = output_ids[:output_ids.index(eos_id) + 1]
+        truncated_outputs.append(output_ids)
+
+    output_texts = [tgt_tokenizer.decode(ids, skip_special_tokens=True) for ids in truncated_outputs]
+    return output_texts

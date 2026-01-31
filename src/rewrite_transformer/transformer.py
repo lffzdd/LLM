@@ -59,7 +59,9 @@ class Transformer(nn.Module):
 
         return output
 
-    def generate(self, src_seq: Tensor, max_len: int, start_id: int, end_id: int):
+    def generate(
+        self, src_seq: Tensor, max_len: int, start_id: int, end_id: int
+    ) -> Tensor:
         src_padding_mask = create_padding_mask(src_seq, self.pad_id)
         encoder_output = self.encoder(src_seq, src_padding_mask)
 

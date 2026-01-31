@@ -155,6 +155,9 @@ def test_generate():
     input_texts = [
         "Good morning everyone, and welcome to this presentation.",
         "Today we will discuss the importance of renewable energy.",
+        "Artificial intelligence is transforming the world as we know it.",
+        "The quick brown fox jumps over the lazy dog.",
+        "In a village of La Mancha, the name of which I have no desire to call",
     ]
 
     outputs = generate(
