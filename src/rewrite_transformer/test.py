@@ -141,12 +141,39 @@ def test_trainTransformer():
         labels_path="../dataset/TED2020.en-zh_cn.zh_cn",
         num_epochs=50,
         use_official_tokenizer=True,
-        resume_training=True
+        resume_training=True,
+        model_save_path='best_model.pth',
     )
 
+def test_generate():
+    from rewrite_transformer.train import generate
+
+    tokenizer_src_path = "../huggingface/en_tokenizer.json"
+    tokenizer_tgt_path = "../huggingface/cn_tokenizer.json"
+    model_path = "best_model.pth"
+
+    input_texts = [
+        "Good morning everyone, and welcome to this presentation.",
+        "Today we will discuss the importance of renewable energy.",
+    ]
+
+    outputs = generate(
+        bpe_src_path=tokenizer_src_path,
+        bpe_tgt_path=tokenizer_tgt_path,
+        model_path=model_path,
+        texts=input_texts,
+        use_official_tokenizer=True,
+        model_save_path='best_model.pth',
+    )
+
+    for input_text, output_text in zip(input_texts, outputs):
+        print(f"Input: {input_text}")
+        print(f"Output: {output_text}")
+        print("-" * 50)
 
 if __name__ == "__main__":
     # test_train_tokenizer()
-    test_trainTransformer()
+    # test_trainTransformer()
     # test_attention()
     # test_transformer()
+    test_generate()

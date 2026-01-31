@@ -229,3 +229,68 @@ def trainTransformer(
 
     torch.save(model.state_dict(), "transformer_model.pth")
     logger.info("Model saved to transformer_model.pth")
+
+
+def generate(
+    bpe_src_path,
+    bpe_tgt_path,
+    model_path,
+    texts,
+    use_official_tokenizer=False,
+    model_save_path="best_model.pth",
+):
+    """使用训练好的Transformer模型进行文本生成
+    Args:
+        bpe_src_path (str): 源语言的BPE词表文件路径
+        bpe_tgt_path (str): 目标语言的BPE词表文件路径
+        model_path (str): 训练好的模型文件路径
+        texts (List[str]): 待生成文本的输入列表
+        use_official_tokenizer (bool, optional): 是否使用官方tokenizer. Defaults to False.
+        model_save_path (str, optional): 模型保存路径. Defaults to "best_model.pth".
+    """
+    from rewrite_transformer.transformer import Transformer
+
+    if use_official_tokenizer:
+        src_tokenizer = loadOfficialTokenizer(bpe_src_path)
+        tgt_tokenizer = loadOfficialTokenizer(bpe_tgt_path)
+    else:
+        src_tokenizer = loadMyTokenizer(bpe_src_path)
+        tgt_tokenizer = loadMyTokenizer(bpe_tgt_path)
+    vocab_size = src_tokenizer.get_vocab_size()
+
+    model = Transformer(
+        tgt_vocab_size=vocab_size,
+        src_vocab_size=vocab_size,
+        embed_dim=512,
+        head_dim=64,
+        head_num=8,
+        max_seq_len=2048,
+        pad_id=src_tokenizer.token_to_id("<PAD>"),
+    )
+    model.load_state_dict(torch.load(model_save_path))
+    model.eval()
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device)
+
+    encoded_ids = []
+    for text in texts:
+        encoded = src_tokenizer.encode(text, add_special_tokens=True).ids
+        encoded_ids.append(encoded)
+
+    src_seq = torch.tensor(encoded_ids).to(device)
+
+    with torch.no_grad():
+        outputs = model.generate(
+            src_seq,
+            max_len=50,
+            start_id=src_tokenizer.token_to_id("<BOS>"),
+            end_id=src_tokenizer.token_to_id("<EOS>"),
+        )
+        outputs=outputs.tolist()
+
+    for i, output_ids in enumerate(outputs):
+        output_text = tgt_tokenizer.decode(output_ids)
+        print(f"Input: {texts[i]}")
+        print(f"Output: {output_text}")
+        print()
