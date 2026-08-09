@@ -111,16 +111,222 @@ def parse_turn(raw: str) -> ParsedTurn:
     return ParsedTurn(kind="tool_calls", parsed=data, tool_calls=tool_calls)
 
 
-def _loads(raw: str) -> dict:
-    """解析合法 JSON 并确认顶层是对象。
+def _strip_markdown_wrapper(text: str) -> str:
+    """剥离模型输出首尾的 Markdown 代码块标记（如 ```json ... ```）。"""
+    cleaned = text.strip().lstrip("\ufeff")
+    if cleaned.startswith("```"):
+        lines = cleaned.splitlines()
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].startswith("```"):
+            lines = lines[:-1]
+        cleaned = "\n".join(lines).strip()
+    return cleaned
 
-    json_object 模式下服务端已保证可解析,这里的 try 是客户端兜底
-    (端点降级/空响应时仍接得住)。
+
+def _fix_unescaped_control_chars(text: str) -> str:
+    """转义字符串内所有未转义的 JSON 控制字符（U+0000—U+001F）。"""
+    result: list[str] = []
+    in_string = False
+    escaped = False
+
+    for char in text:
+        if in_string:
+            if escaped:
+                result.append(char)
+                escaped = False
+            elif char == "\\":
+                result.append(char)
+                escaped = True
+            elif char == '"':
+                result.append(char)
+                in_string = False
+            elif ord(char) < 0x20:
+                # json.dumps 会为 \b/\f/\n/\r/\t 选短转义，其余用 \u00xx。
+                result.append(json.dumps(char)[1:-1])
+            else:
+                result.append(char)
+            continue
+
+        if char == '"':
+            in_string = True
+        result.append(char)
+
+    return "".join(result)
+
+
+def _fix_trailing_commas(text: str) -> str:
+    """移除 JSON 对象或数组末尾多余的逗号（如 {"a": 1,} 或 [1, 2,]）。"""
+    # 不能用正则：字符串值本身可能合法地包含 `,}` 或 `,]`。
+    result: list[str] = []
+    in_string = False
+    escaped = False
+    length = len(text)
+
+    for index, char in enumerate(text):
+        if in_string:
+            result.append(char)
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+
+        if char == '"':
+            in_string = True
+            result.append(char)
+            continue
+
+        if char == ",":
+            lookahead = index + 1
+            while lookahead < length and text[lookahead].isspace():
+                lookahead += 1
+            if lookahead < length and text[lookahead] in "}]":
+                continue
+
+        result.append(char)
+
+    return "".join(result)
+
+
+def _close_unfinished_containers(text: str) -> str:
+    """补齐输出末尾遗漏的 `}`/`]`，但不猜测未闭合字符串或错配结构。"""
+    stack: list[str] = []
+    in_string = False
+    escaped = False
+
+    for char in text:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            stack.append("}")
+        elif char == "[":
+            stack.append("]")
+        elif char in "}]":
+            # 中途闭合错配不是简单的输出截尾，不能擅自猜测修复。
+            if not stack or stack[-1] != char:
+                return text
+            stack.pop()
+
+    # 字符串本身未结束往往表示回答真的被截断；此时不要把半段内容当成功。
+    if in_string:
+        return text
+    return text + "".join(reversed(stack))
+
+
+def _object_candidates(text: str) -> list[tuple[int, dict]]:
+    """找出文本中可独立解码的 JSON 对象，不被字符串内的花括号干扰。"""
+    decoder = json.JSONDecoder()
+    candidates: list[tuple[int, dict]] = []
+    for start, char in enumerate(text):
+        if char != "{":
+            continue
+        try:
+            value, _ = decoder.raw_decode(text, start)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict):
+            candidates.append((start, value))
+    return candidates
+
+
+def _decode_embedded_object(text: str) -> dict | None:
+    """从带说明文字的输出中选择最像回合信封的 JSON 对象。"""
+    candidates = _object_candidates(text)
+    if not candidates:
+        return None
+
+    protocol_keys = {"reasoning", "tool_calls", "final_answer"}
+    # 优先包含最多协议字段的对象；同分时采用最先出现的对象。这样不会误选
+    # tool_calls.arguments 中可独立解析的嵌套对象。
+    _, value = max(
+        candidates,
+        key=lambda item: (len(protocol_keys.intersection(item[1])), -item[0]),
+    )
+    return value
+
+
+def _decode_once_or_twice(text: str) -> Any:
+    """解析完整 JSON；兼容少数网关把整个 JSON 信封再次编码成字符串。"""
+    value = json.loads(text)
+    if isinstance(value, str):
+        nested = value.strip()
+        if nested.startswith("{"):
+            value = json.loads(nested)
+    return value
+
+
+def _format_decode_error(error: json.JSONDecodeError, text: str) -> str:
+    """给重试提示保留准确位置和一小段上下文。"""
+    start = max(0, error.pos - 30)
+    end = min(len(text), error.pos + 30)
+    excerpt = text[start:end].replace("\n", "\\n").replace("\r", "\\r")
+    return (
+        f"{error.msg} (第 {error.lineno} 行, 第 {error.colno} 列); "
+        f"附近内容: {excerpt!r}"
+    )
+
+
+def _loads(raw: str) -> dict:
+    """强健地解析 JSON 并确认顶层是对象。
+
+    包含多重容错与防御机制：
+    1. 剥离 Markdown 代码块（如 ```json ... ```）
+    2. 尝试标准解析
+    3. 修复字符串内未转义的原生换行符/控制字符
+    4. 移除末尾多余逗号
+    5. 补齐末尾遗漏的对象/数组闭合括号
+    6. 从说明文字中定位可独立解码的协议对象
     """
-    try:
-        data = json.loads(raw)
-    except (json.JSONDecodeError, TypeError) as e:
-        raise TurnAbort(f"LLM 输出不是合法 JSON: {e}") from e
-    if not isinstance(data, dict):
-        raise TurnAbort(f"LLM 输出顶层必须是对象,得到 {type(data).__name__}")
-    return data
+    if not isinstance(raw, str):
+        raise TurnAbort(f"LLM 输出必须是字符串, 得到 {type(raw).__name__}")
+    if not raw.strip():
+        raise TurnAbort("LLM 输出为空")
+
+    cleaned = _strip_markdown_wrapper(raw)
+    fixed_controls = _fix_unescaped_control_chars(cleaned)
+    closed = _close_unfinished_containers(fixed_controls)
+    repaired = _fix_trailing_commas(closed)
+    variants = [cleaned] if repaired == cleaned else [cleaned, repaired]
+    errors: list[tuple[json.JSONDecodeError, str]] = []
+    non_object_type: str | None = None
+
+    # 先要求整段是 JSON，避免对本来正确的内容做任何修改。
+    for variant in variants:
+        try:
+            data = _decode_once_or_twice(variant)
+        except json.JSONDecodeError as error:
+            errors.append((error, variant))
+        else:
+            if isinstance(data, dict):
+                return data
+            non_object_type = type(data).__name__
+
+    # 再处理代码块外说明文字、<think> 标签等包装。raw_decode 会在正确的
+    # 对象闭括号处停止，因此不会被后缀中的 `}` 或字符串里的花括号带偏。
+    for variant in variants:
+        data = _decode_embedded_object(variant)
+        if data is not None:
+            return data
+
+    if non_object_type is not None:
+        raise TurnAbort(f"LLM 输出顶层必须是对象, 得到 {non_object_type}")
+
+    if errors:
+        # 修复后走得最远的错误通常最接近真正病灶，比最后重跑原文更有用。
+        error, source = max(errors, key=lambda item: item[0].pos)
+        detail = _format_decode_error(error, source)
+        raise TurnAbort(f"LLM 输出不是合法 JSON: {detail}") from error
+
+    raise TurnAbort("LLM 输出中没有找到 JSON 对象")

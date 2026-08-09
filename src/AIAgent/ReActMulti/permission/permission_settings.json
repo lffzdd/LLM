@@ -6,7 +6,8 @@
       "execute_command(pwd*)",
       "execute_command(cat *)",
       "execute_command(echo *)",
-      "write_file"
+      "write_file",
+      "edit_file"
     ],
     "deny": [
       "execute_command(rm *)",

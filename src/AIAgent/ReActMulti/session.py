@@ -8,12 +8,13 @@ from uuid import uuid4
 
 from openai.types.chat import ChatCompletionMessageParam
 
+from .planning import PlanManager
 from .tools.base import ToolResult, ToolCall
 from .util import estimate_message_tokens
 
 CallId: TypeAlias = str
 MessageId: TypeAlias = str
-SessionStatus = Literal["running", "completed", "failed", "max_steps", "waiting_user"]
+SessionStatus = Literal["running", "completed", "failed", "max_steps"]
 TurnRoute = Literal["tool_calls", "final", "invalid"]
 ToolExecutionTerminal = Literal["succeeded", "failed", "timeout"]
 ToolExecutionStatus = Literal["pending", "running"] | ToolExecutionTerminal
@@ -35,7 +36,11 @@ class SessionState:
 
     tool_executions: dict[CallId, ToolExecutionRecord]
     background_tasks: dict[str, BackgroundTask]
-
+    plan_manager: PlanManager
+    # 当前 user turn 从哪个全局 step 之后开始。Verifier 用它隔离多轮 REPL 中
+    # 旧任务的工具证据；checkpoint/resume 也靠它恢复本轮边界。
+    active_turn_start_step: int = 0
+    active_turn_start_message_index: int = 0
     last_usage: UsageRecord | None = None
     total_usage: UsageRecord = field(default_factory=lambda: UsageRecord())
 
@@ -68,6 +73,7 @@ class SessionState:
             message_records=[],
             tool_executions={},
             background_tasks={},
+            plan_manager=PlanManager(),
             max_steps=max_steps,
         )
 
@@ -90,6 +96,12 @@ class SessionState:
     def _next_step(self) -> int:
         self.step_count += 1
         return self.step_count
+
+    def begin_user_turn(self, prompt: str) -> None:
+        """记录当前任务目标及其证据边界。"""
+        self.user_goal = prompt
+        self.active_turn_start_step = self.step_count
+        self.active_turn_start_message_index = len(self.message_records)
 
     def _next_message_id(self) -> MessageId:
         self.message_id_counter += 1
@@ -239,6 +251,18 @@ class SessionState:
         self.total_usage.completion_tokens += usage.completion_tokens
         self.total_usage.total_tokens += usage.total_tokens
 
+    def record_verification(
+        self,
+        turn: "TurnRecord",
+        approved: bool,
+        issues: list[dict[str, str]],
+    ) -> "VerificationRecord":
+        if turn not in self.turns or turn.route != "final":
+            raise ValueError("verification 只能关联已记录的 final turn")
+        record = VerificationRecord(approved=approved, issues=issues)
+        turn.verification = record
+        return record
+
     def mark_running(self) -> None:
         # 多轮对话:新一轮开始时把上一轮留下的终态(completed/failed/max_steps)
         # 重置回 running,让 status 始终反映"当前这轮"而非历史。
@@ -310,6 +334,13 @@ class TurnRecord:
     error: str | None = None
 
     usage: UsageRecord | None = None
+    verification: "VerificationRecord | None" = None
+
+
+@dataclass
+class VerificationRecord:
+    approved: bool
+    issues: list[dict[str, str]]
 
 
 @dataclass

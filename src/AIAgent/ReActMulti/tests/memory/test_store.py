@@ -3,6 +3,10 @@
 from pathlib import Path
 
 from ...memory.store import (
+    MemoryAlreadyExistsError,
+    MemoryNotFoundError,
+    create_memory,
+    delete_memory,
     MAX_INDEX_LINES,
     dump_frontmatter,
     format_manifest,
@@ -11,9 +15,12 @@ from ...memory.store import (
     read_memories_for_surfacing,
     rebuild_index,
     scan_memory_files,
+    search_memories,
     slugify,
+    update_memory,
     write_memory_file,
 )
+import pytest
 
 
 def test_frontmatter_round_trip():
@@ -97,3 +104,38 @@ def test_read_memories_for_surfacing(tmp_path: Path):
     block = read_memories_for_surfacing([p])
     assert "### a.md" in block
     assert "正文 X" in block
+
+
+def test_semantic_memory_crud_keeps_stable_unicode_id_and_index(tmp_path: Path):
+    created = create_memory(
+        "用户偏好", "用户偏好的包管理器", "user", "优先使用 uv", tmp_path
+    )
+    assert created.id == "用户偏好"
+    assert created.path.stat().st_mode & 0o777 == 0o600
+
+    with pytest.raises(MemoryAlreadyExistsError):
+        create_memory("用户偏好", "重复", "user", "不要覆盖", tmp_path)
+
+    updated = update_memory(
+        created.id,
+        name="Python 工具偏好",
+        description="更新后的描述",
+        content="优先使用 uv，除非项目明确要求其它工具",
+        directory=tmp_path,
+    )
+    assert updated.id == created.id  # 改展示名不会破坏已有引用
+    assert updated.name == "Python 工具偏好"
+    assert updated.created_at == created.created_at
+    assert updated.updated_at >= created.updated_at
+    assert search_memories("uv", type_="user", directory=tmp_path) == [updated]
+
+    deleted = delete_memory(created.id, tmp_path)
+    assert deleted.id == created.id
+    assert "用户偏好.md" not in (tmp_path / "MEMORY.md").read_text(encoding="utf-8")
+    with pytest.raises(MemoryNotFoundError):
+        delete_memory(created.id, tmp_path)
+
+
+def test_memory_id_rejects_path_traversal(tmp_path: Path):
+    with pytest.raises(Exception, match="memory_id"):
+        update_memory("../outside", content="x", directory=tmp_path)

@@ -14,6 +14,7 @@ dependencies = [
     "openai>=2.29.0",
     "dotenv>=0.9.9",
     "mcp>=1.28.0",
+    "jsonschema>=4.26.0",
     "pymupdf>=1.27.2.3",
     "python-docx>=1.2.0",
     "jieba>=0.42.1",
@@ -21,6 +22,7 @@ dependencies = [
     # RAGAS 0.4.3 仍会导入旧版 LangChain VertexAI 模块；等待上游修复后可移除此约束。
     "langchain-community<0.4",
     "graspologic>=3.4.4",
+    "prompt-toolkit>=3.0.53",
 ]
 
 [[tool.uv.index]]

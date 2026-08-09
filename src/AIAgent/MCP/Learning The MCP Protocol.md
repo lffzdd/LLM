@@ -43,6 +43,7 @@ MCP 的核心思想就是：
 > **定义一个统一的协议，让任何 "工具服务端" 和任何 "AI Agent 客户端" 都能即插即用地通信，不用写定制化的适配代码。**
 
 用一个类比：
+
 - **没有 MCP** → 每个充电器只能给特定手机充电（私有接口）
 - **有了 MCP** → 大家都用 USB-C（统一协议）
 
@@ -52,11 +53,11 @@ MCP 的核心思想就是：
 
 MCP 里只有三个角色：
 
-| 角色 | 是谁 | 类比 |
-|------|------|------|
-| **Host** | 你的 AI 应用（比如 IDE、Chat 界面） | 用户面前的那个 App |
-| **Client** | Host 内部负责和 Server 通信的模块 | App 里的 "插头" |
-| **Server** | 提供工具/资源/提示的外部服务 | 外部的 "工具箱" |
+| 角色             | 是谁                                | 类比               |
+| ---------------- | ----------------------------------- | ------------------ |
+| **Host**   | 你的 AI 应用（比如 IDE、Chat 界面） | 用户面前的那个 App |
+| **Client** | Host 内部负责和 Server 通信的模块   | App 里的 "插头"    |
+| **Server** | 提供工具/资源/提示的外部服务        | 外部的 "工具箱"    |
 
 关系是：`Host` 内部创建 `Client`，`Client` 和 `Server` 一对一连接。
 
@@ -106,6 +107,7 @@ JSON-RPC 只有三种消息类型：
 ```
 
 关键字段：
+
 - `id`：给这次请求编个号，对方回复时带上同一个 `id`，你就知道这是哪个请求的回复
 - `method`：要调用的方法名（MCP 预定义了一组方法名，比如 `tools/call`、`tools/list`）
 - `params`：参数
@@ -178,16 +180,16 @@ JSON-RPC 只有三种消息类型：
 
 MCP 在 JSON-RPC 之上定义了这些关键的 `method`：
 
-| method | 方向 | 作用 |
-|--------|------|------|
-| `initialize` | Client → Server | 握手，交换双方能力 |
-| `notifications/initialized` | Client → Server | 通知"初始化完成" |
-| `tools/list` | Client → Server | 获取 Server 提供的所有工具列表 |
-| `tools/call` | Client → Server | 调用某个工具 |
-| `resources/list` | Client → Server | 获取 Server 提供的资源列表 |
-| `resources/read` | Client → Server | 读取某个资源 |
-| `prompts/list` | Client → Server | 获取 Server 提供的 prompt 模板 |
-| `prompts/get` | Client → Server | 获取某个 prompt 的内容 |
+| method                        | 方向             | 作用                           |
+| ----------------------------- | ---------------- | ------------------------------ |
+| `initialize`                | Client → Server | 握手，交换双方能力             |
+| `notifications/initialized` | Client → Server | 通知"初始化完成"               |
+| `tools/list`                | Client → Server | 获取 Server 提供的所有工具列表 |
+| `tools/call`                | Client → Server | 调用某个工具                   |
+| `resources/list`            | Client → Server | 获取 Server 提供的资源列表     |
+| `resources/read`            | Client → Server | 读取某个资源                   |
+| `prompts/list`              | Client → Server | 获取 Server 提供的 prompt 模板 |
+| `prompts/get`               | Client → Server | 获取某个 prompt 的内容         |
 
 现阶段只需要关注前四个（`initialize` + `tools/*`），其余的后面再说。
 
@@ -257,6 +259,7 @@ MCP 的 `tools/call` 返回格式：
 ```
 
 **核心区别：**
+
 - 你的格式是**自定义的**（`ok`/`err`/`data`），只有你的 Agent 认识
 - MCP 格式是**标准化的**（`content` 数组 + `type`），任何 MCP Client 都认识
 
@@ -430,13 +433,13 @@ mcp_result = await session.call_tool(fn_name, fn_args)
 
 **总结到这一步**，你已经从底层到应用层完整理解了：
 
-| 步骤 | 你学到了什么 |
-|------|------------|
-| Step 1 | MCP 要解决的问题（工具的标准化通信） |
-| Step 2 | 协议基础（JSON-RPC 2.0 的三种消息） |
-| Step 3 | 手写 Server（看清底层就是 stdin/stdout + JSON） |
-| Step 4 | SDK Server（装饰器注册工具，SDK 处理协议细节） |
-| Step 5 | Client 端（连接、握手、发现工具、调用工具） |
+| 步骤   | 你学到了什么                                                         |
+| ------ | -------------------------------------------------------------------- |
+| Step 1 | MCP 要解决的问题（工具的标准化通信）                                 |
+| Step 2 | 协议基础（JSON-RPC 2.0 的三种消息）                                  |
+| Step 3 | 手写 Server（看清底层就是 stdin/stdout + JSON）                      |
+| Step 4 | SDK Server（装饰器注册工具，SDK 处理协议细节）                       |
+| Step 5 | Client 端（连接、握手、发现工具、调用工具）                          |
 | Step 6 | **接入 LLM Agent**（MCP 工具 → function calling → LLM 决策） |
 
 **下一步**可以讲 MCP 的另外两大能力 **Resources（资源）** 和 **Prompts（提示模板）**，或者讲 **传输层（stdio vs HTTP）**。你想先看哪个？
@@ -459,7 +462,7 @@ mcp_result = await session.call_tool(fn_name, fn_args)
 
 *Edited relevant file*
 
-*Viewed [Learning The MCP Protocol.md](file:///Users/slyh/MyDir/Project/LLM/src/AIAgent/MCP/Learning%20The%20MCP%20Protocol.md) *
+*Viewed [Learning The MCP Protocol.md](<file:///Users/slyh/MyDir/Project/LLM/src/AIAgent/MCP/Learning%20The%20MCP%20Protocol.md>) *
 
 ### Planner Response
 
@@ -471,11 +474,11 @@ MCP 的设计是**协议层和传输层分离**的。JSON-RPC 消息是"说什�
 
 ### 三种传输方式对比
 
-| 传输方式 | 通信方式 | 适用场景 | Client 和 Server 的关系 |
-|---------|---------|---------|----------------------|
-| **stdio** | 子进程的 stdin/stdout 管道 | 本地工具（CLI、文件操作） | 同一台机器，1对1 |
-| **SSE** *(已淘汰)* | HTTP GET(SSE下行) + HTTP POST(上行) | 远程服务（旧方案） | 可跨网络，但有限制 |
-| **Streamable HTTP** | HTTP POST（双向，支持 SSE 流） | 远程服务（新标准） | 可跨网络，支持多 Client |
+| 传输方式                   | 通信方式                            | 适用场景                  | Client 和 Server 的关系 |
+| -------------------------- | ----------------------------------- | ------------------------- | ----------------------- |
+| **stdio**            | 子进程的 stdin/stdout 管道          | 本地工具（CLI、文件操作） | 同一台机器，1对1        |
+| **SSE** *(已淘汰)* | HTTP GET(SSE下行) + HTTP POST(上行) | 远程服务（旧方案）        | 可跨网络，但有限制      |
+| **Streamable HTTP**  | HTTP POST（双向，支持 SSE 流）      | 远程服务（新标准）        | 可跨网络，支持多 Client |
 
 ### stdio 你已经很熟了
 
@@ -583,12 +586,12 @@ async with streamablehttp_client(url) as (read, write, _):    # ← 只有这行
 
 ### 什么时候用哪种？
 
-| 场景 | 选哪个 | 理由 |
-|------|--------|------|
-| IDE 里的本地工具 | **stdio** | 简单，不用起 HTTP 服务 |
+| 场景               | 选哪个                    | 理由                    |
+| ------------------ | ------------------------- | ----------------------- |
+| IDE 里的本地工具   | **stdio**           | 简单，不用起 HTTP 服务  |
 | 团队共享的工具服务 | **Streamable HTTP** | 一个 Server 多个 Client |
-| 部署在云端的工具 | **Streamable HTTP** | 跨网络访问 |
-| 需要认证/鉴权 | **Streamable HTTP** | 可以加 HTTP headers |
+| 部署在云端的工具   | **Streamable HTTP** | 跨网络访问              |
+| 需要认证/鉴权      | **Streamable HTTP** | 可以加 HTTP headers     |
 
 ---
 
@@ -627,12 +630,12 @@ MCP Server 的三种能力
 
 这是最容易混淆的地方，用一个直觉来区分：
 
-| | Tools | Resources |
-|--|-------|-----------|
-| 类比 | **函数调用**（做某件事） | **文件/数据读取**（拿某个东西） |
-| 谁决定用 | **LLM** 在对话中自己决定 | **用户或应用**在对话前选好 |
-| 有副作用吗 | 可能有（写文件、发请求） | 没有（只读） |
-| 例子 | `run_sql(query)` | `db://tables/users` 的 schema |
+|            | Tools                          | Resources                             |
+| ---------- | ------------------------------ | ------------------------------------- |
+| 类比       | **函数调用**（做某件事） | **文件/数据读取**（拿某个东西） |
+| 谁决定用   | **LLM** 在对话中自己决定 | **用户或应用**在对话前选好      |
+| 有副作用吗 | 可能有（写文件、发请求）       | 没有（只读）                          |
+| 例子       | `run_sql(query)`             | `db://tables/users` 的 schema       |
 
 **一句话：Tools 是"动词"，Resources 是"名词"。**
 
@@ -651,27 +654,33 @@ MCP Server 的三种能力
 看 [step6_resources_prompts.py](file:///Users/slyh/MyDir/Project/LLM/src/AIAgent/MCP/step6_resources_prompts.py) 的输出：
 
 **1. 静态 URI 资源** — `config://app/settings`
+
 ```python
 @server.resource(uri="config://app/settings")
 def get_app_settings() -> str:
     return json.dumps({...})
 ```
+
 URI 固定，每次 `resources/read` 时调用函数获取内容。
 
 **2. 动态数据资源** — `data://system/status`
+
 ```python
 @server.resource(uri="data://system/status")
 def get_system_status() -> str:
     return json.dumps({"timestamp": datetime.now().isoformat(), ...})
 ```
+
 每次读取返回不同内容（时间戳变了）。
 
 **3. URI 模板资源** — `users://{user_id}/profile`
+
 ```python
 @server.resource(uri="users://{user_id}/profile")
 def get_user_profile(user_id: str) -> str:   # URI 里的 {user_id} → 函数参数
     ...
 ```
+
 类似 REST API 的路径参数。Client 请求 `users://alice/profile`，函数收到 `user_id="alice"`。
 
 ### Prompts 的用法
@@ -711,6 +720,7 @@ Client 调用 `prompts/get("code-review", {"code": "...", "language": "python"})
 ---
 
 到这里，MCP 的三大能力你都了解了。**下一步**可以讲：
+
 - **实战：写一个真正有用的 MCP Server**（比如文件系统操作、数据库查询）
 - **MCP 的高级特性**（Sampling、Roots、Notifications 等）
 

@@ -28,6 +28,7 @@ from .tools.base import (
     ToolResult,
     ToolRuntime,
 )
+from .tools.validation import validate_tool_arguments
 
 
 @dataclass(frozen=True)
@@ -92,6 +93,10 @@ class ToolExecutor:
         if tool is None:
             return ToolResult.fail(err=f"Unknown tool: {tool_call.name}")
 
+        validation_error = validate_tool_arguments(tool, tool_call.arguments)
+        if validation_error is not None:
+            return validation_error
+
         runtime = replace(
             self.runtime,
             tool_name=tool_call.name,
@@ -133,6 +138,10 @@ class ToolExecutor:
             else permission.updated_arguments
         )
 
+        updated_validation_error = validate_tool_arguments(tool, arguments)
+        if updated_validation_error is not None:
+            return updated_validation_error
+
         # 内层超时必须 ≤ 外层线程预算:模型可以给工具传很大的 timeout,
         # 不钳制的话外层先掐,工具内部的超时机制(如 execute_command 转后台)永远轮不到登场
         if isinstance(arguments.get("timeout"), (int, float)):
@@ -160,6 +169,8 @@ class ToolExecutor:
         """按本次参数判断能否并发；未知/判断异常一律按排他执行。"""
         tool = self.tool_registry.get(tool_call.name)
         if tool is None:
+            return False
+        if validate_tool_arguments(tool, tool_call.arguments) is not None:
             return False
         try:
             return bool(tool.is_concurrency_safe(dict(tool_call.arguments)))

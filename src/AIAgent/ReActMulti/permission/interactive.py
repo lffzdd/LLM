@@ -7,20 +7,23 @@
 
 相比规则式,交互式多出三个新关注点,代码里都会点到:
 1. 状态:`a`(本会话总是允许)要被记住 → handler 实例持有一个 set(它第一次有记忆)。
-2. 并发:http_request 是 parallel 工具,可能多线程同时触发 ask;两个线程同时 input()
-   会把终端搅乱 → 用一把锁把"打印 + 读取"整段串起来。
-3. 可测:不能在测试里真等人敲键盘 → 把 input/print 做成可注入参数(同 renderer 回调思路)。
+2. 并发:http_request 是 parallel 工具,可能多线程同时触发 ask;终端的并发保护由
+   Renderer 内部的锁负责(ConsoleRenderer._prompt_lock),handler 不再自己持锁。
+3. 可测:不能在测试里真等人敲键盘 → 注入一个覆盖了 prompt_permission 的 mock
+   Renderer(比原来的 input_fn/output_fn 更贴近真实调用路径)。
 
 fail-closed:空输入、看不懂的输入、读不到终端(EOF)一律当拒——拿不准就不放行。
 """
 
 from __future__ import annotations
 
-import threading
-from typing import Callable
+from typing import TYPE_CHECKING, Callable
 
 from .resolver import PermissionRequest
 from .types import PermissionCheckResult
+
+if TYPE_CHECKING:
+    from ..renderer import Renderer
 
 
 class InteractiveApprovalHandler:
@@ -28,14 +31,11 @@ class InteractiveApprovalHandler:
 
     def __init__(
         self,
-        input_fn: Callable[[str], str] = input,
-        output_fn: Callable[[str], None] = print,
+        renderer: Renderer,
         on_remember: Callable[[str], None] | None = None,
     ):
-        # 注入 io 而非直接绑死内置 input/print:测试里塞个假的就能驱动整条交互,
-        # 不用真去读 stdin。
-        self._input = input_fn
-        self._output = output_fn
+        # UI 展示 + 输入收集全部委托给 Renderer。handler 只管决策。
+        self._renderer = renderer
         # "别再问"的落盘钩子:用户选 a 时调它把规则固化(如写回 settings.json)。
         # 做成回调而非在 handler 里直接写文件——handler 不该知道"配置存在哪、什么格式",
         # 那是装配层的事;不接这个钩子时 a 就只在本会话内存里生效。
@@ -45,53 +45,34 @@ class InteractiveApprovalHandler:
         # 粒度选工具名而非"工具+具体参数":后者几乎不会复用,工具名级才真正省事。
         # 代价是 a execute_command 等于放行该工具任意命令,所以只在低风险时给 a 选项。
         self._always_allow: set[str] = set()
-        # parallel 工具(如 http_request)可能在线程池里并发问;锁保证终端一次只问一题。
-        self._lock = threading.Lock()
 
     def __call__(self, request: PermissionRequest) -> PermissionCheckResult:
         tool_name = request.tool.name
 
-        with self._lock:
-            if tool_name in self._always_allow:
-                return self._allow(request, f"本会话已记住:总是允许 {tool_name}")
+        if tool_name in self._always_allow:
+            return self._allow(request, f"本会话已记住:总是允许 {tool_name}")
 
-            self._render(request)
-            offer_always = self._allow_always_offered(request)
-            answer = self._ask(offer_always)
+        offer_always = self._allow_always_offered(request)
+        answer = self._renderer.prompt_permission(
+            tool_name=tool_name,
+            subject=_subject_line(request.arguments),
+            risk_flags=", ".join(request.check.risk_flags) or "无",
+            reason=request.check.reason,
+            offer_always=offer_always,
+        )
 
-            if answer == "a" and offer_always:
-                self._always_allow.add(tool_name)
-                if self._on_remember is not None:
-                    # 落盘成一条 allow 规则;工具名级记忆 → 规则就是裸工具名。
-                    self._on_remember(tool_name)
-                scope = "并已写入配置(跨会话生效)" if self._on_remember else "本会话内"
-                return self._allow(request, f"用户批准,记住总是允许 {tool_name}({scope})")
-            if answer == "y":
-                return self._allow(request, "用户批准本次执行")
-            return self._deny(request, f"用户拒绝(输入 {answer!r})")
+        if answer == "a" and offer_always:
+            self._always_allow.add(tool_name)
+            if self._on_remember is not None:
+                # 落盘成一条 allow 规则;工具名级记忆 → 规则就是裸工具名。
+                self._on_remember(tool_name)
+            scope = "并已写入配置(跨会话生效)" if self._on_remember else "本会话内"
+            return self._allow(request, f"用户批准,记住总是允许 {tool_name}({scope})")
+        if answer == "y":
+            return self._allow(request, "用户批准本次执行")
+        return self._deny(request, f"用户拒绝(输入 {answer!r})")
 
-    # ── 终端呈现与读取 ────────────────────────────────────────────────────────
-
-    def _render(self, request: PermissionRequest) -> None:
-        flags = ", ".join(request.check.risk_flags) or "无"
-        subject = _subject_line(request.arguments)
-        self._output("")
-        self._output("⚠️  需要权限确认")
-        self._output(f"  工具: {request.tool.name}")
-        if subject:
-            self._output(f"  参数: {subject}")
-        self._output(f"  风险: {flags}")
-        self._output(f"  说明: {request.check.reason}")
-
-    def _ask(self, offer_always: bool) -> str:
-        choices = "[y]允许一次 / [n]拒绝"
-        if offer_always:
-            choices += " / [a]本会话总是允许该工具"
-        try:
-            return self._input(f"  允许执行? {choices}: ").strip().lower()
-        except EOFError:
-            # 没有真正的交互终端(如管道/CI)→ 当拒,绝不静默放行。
-            return "n"
+    # ── 策略 ──────────────────────────────────────────────────────────────────
 
     @staticmethod
     def _allow_always_offered(request: PermissionRequest) -> bool:
@@ -120,3 +101,4 @@ def _subject_line(arguments: dict) -> str:
         if isinstance(value, str) and value:
             return f"{key}={value}"
     return ""
+

@@ -34,11 +34,13 @@ def build_memory_instructions(directory: Path | None = None) -> str:
 第 2 步——在 `MEMORY.md` 里加一行指向该文件的指针。`MEMORY.md` 是索引不是记忆,
 每条一行、不带 frontmatter。绝不要把记忆正文直接写进 `MEMORY.md`。
 
-(用 `save_memory` 工具保存时,以上两步会自动替你完成:它写文件并重建索引。)
+(用 `create_memory` / `update_memory` 工具保存时,以上两步会自动完成：
+记忆文件和索引会作为一次存储操作一起维护。)
 
 - 按主题(语义)组织记忆,而非按时间顺序。
-- 发现某条记忆过时或错了,就更新或删除它。
-- 不要写重复记忆:写新记忆前先看有没有可更新的现有记忆(可用 `search_memory` 查)。"""
+- 新主题使用 `create_memory`；已有主题使用 `update_memory`，不要静默覆盖。
+- 发现某条记忆过时或错了,就更新；用户明确要求忘记时才删除。
+- 不要写重复记忆:写新记忆前先用 `search_memory` 查找，并用 `get_memory` 阅读候选正文。"""
 
     sections = [
         "# 长期记忆",
@@ -62,5 +64,7 @@ def build_memory_instructions(directory: Path | None = None) -> str:
         "## 记忆与其它持久化机制的边界",
         "记忆用于【未来对话】仍有用的信息。只在【当前对话】范围内有用的东西不要存记忆——"
         "当前任务的步骤与进度,用任务/计划机制承载;记忆留给跨会话的长期知识。",
+        "历史 episode 由系统在每个 user turn 终止时自动记录；不要手工创建或修改它。"
+        "它只能作为过去的执行经验，使用前必须重新核实当前状态。",
     ]
     return "\n".join(sections)

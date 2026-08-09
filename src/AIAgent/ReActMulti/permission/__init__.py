@@ -17,6 +17,7 @@ from .types import PermissionCheckResult, PermissionDecision
 from .resolver import (
     FallbackApprovalHandler,
     PermissionApprovalHandler,
+    UserInteractionHandler,
     PermissionPolicy,
     PermissionRequest,
     PermissionResolver,
@@ -36,6 +37,7 @@ __all__ = [
     "PermissionCheckResult",
     "PermissionDecision",
     "PermissionApprovalHandler",
+    "UserInteractionHandler",
     "PermissionPolicy",
     "PermissionRequest",
     "PermissionResolver",

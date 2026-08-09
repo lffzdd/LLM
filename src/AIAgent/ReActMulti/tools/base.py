@@ -73,6 +73,10 @@ class Tool:
         _default_check_permission
     )
     is_concurrency_safe: Callable[[dict[str, Any]], bool] = _not_concurrency_safe
+    # 这类工具不能被普通的 allow/bypass 规则直接放行。执行器会把它们交给
+    # PermissionResolver 的 interaction_handler，由交互层回填已确认的 arguments
+    # 后才调用 call()。ask_user 是当前唯一使用者，未来 TUI/Web 表单也可复用。
+    requires_user_interaction: bool = False
     # executor:统一 deadline + 协作取消；tool:工具自己定义超时语义(如 shell 转后台)。
     timeout_owner: TimeoutOwner = "executor"
 

@@ -37,6 +37,8 @@ import json
 from pathlib import Path
 from typing import Any, Sequence
 
+from rich.console import Console
+
 from .llm import LLMClient
 from .permission import PermissionResolver
 from .renderer import Renderer, SilentRenderer
@@ -65,9 +67,12 @@ class SubAgentRenderer(Renderer):
         self.task = task
         # depth 从 1 起(主 Agent 是 0),缩进与竖线让嵌套关系可读。
         self._prefix = "    " * (depth - 1) + "│ "
+        self._console = Console(highlight=False)
 
-    def _line(self, text: str) -> None:
-        print(f"{self._prefix}{text}", flush=True)
+    def _line(self, text: str, style: str = "") -> None:
+        self._console.print(
+            f"{self._prefix}{text}", style=style, highlight=False, markup=False,
+        )
 
     def on_reasoning_delta(self, piece: str) -> None: ...  # 子 Agent 思考过程不外显
     def on_content_delta(self, piece: str) -> None: ...  # 子 Agent 中间内容不外显
@@ -78,15 +83,15 @@ class SubAgentRenderer(Renderer):
         brief = json.dumps(args, ensure_ascii=False)
         if len(brief) > 80:
             brief = brief[:77] + "..."
-        self._line(f"🔧 子Agent(d{self.depth}) › {tool_call.name} {brief}")
+        self._line(f"🔧 子Agent(d{self.depth}) › {tool_call.name} {brief}", "yellow")
 
     def on_tool_result(self, tool_result) -> None:
         if hasattr(tool_result, "to_dict"):
             tool_result = tool_result.to_dict()
         if tool_result.get("ok"):
-            self._line("✅ 子工具完成")
+            self._line("✅ 子工具完成", "green")
         else:
-            self._line(f"❌ 子工具失败: {tool_result.get('err')}")
+            self._line(f"❌ 子工具失败: {tool_result.get('err')}", "red")
 
     def on_final(self, answer) -> None:
         text = answer if isinstance(answer, str) else json.dumps(
@@ -94,7 +99,8 @@ class SubAgentRenderer(Renderer):
         )
         if len(text) > 200:
             text = text[:197] + "..."
-        self._line(f"🎯 子Agent(d{self.depth}) 收口: {text}")
+        self._line(f"🎯 子Agent(d{self.depth}) 收口: {text}", "green")
+
 
 
 SPAWN_AGENT_PARAMETERS = {

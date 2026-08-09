@@ -6,7 +6,15 @@ from pathlib import Path
 from ...events import ContentDone
 from ...memory.recall import build_recall_block, find_relevant_memories
 from ...memory.store import write_memory_file
-from ...tools.memory_tools import save_memory, search_memory
+from ...tools.memory_tools import (
+    build_memory_tools,
+    create_memory,
+    delete_memory,
+    get_memory,
+    save_memory,
+    search_memory,
+    update_memory,
+)
 
 
 class FakeLLM:
@@ -78,3 +86,33 @@ def test_search_memory_lists(tmp_path: Path, monkeypatch):
     assert res.ok
     assert res.data["count"] == 1
     assert "a.md" in res.data["memories"]
+
+
+def test_explicit_memory_crud_tools(tmp_path: Path):
+    created = create_memory("project-api", "API decision", "project", "use v2", directory=tmp_path)
+    assert created.ok
+    memory_id = created.data["id"]
+    assert not create_memory("project-api", "duplicate", "project", "x", directory=tmp_path).ok
+
+    fetched = get_memory(memory_id, directory=tmp_path)
+    assert fetched.ok and fetched.data["content"] == "use v2"
+
+    updated = update_memory(memory_id, content="use v3", directory=tmp_path)
+    assert updated.ok and updated.data["content"] == "use v3"
+    assert not update_memory(memory_id, directory=tmp_path).ok
+
+    deleted = delete_memory(memory_id, directory=tmp_path)
+    assert deleted.ok
+    assert not get_memory(memory_id, directory=tmp_path).ok
+
+
+def test_bound_toolset_uses_explicit_crud_without_legacy_upsert(tmp_path: Path):
+    tools = build_memory_tools(tmp_path, include_legacy_save=False)
+    assert [tool.name for tool in tools] == [
+        "create_memory", "get_memory", "update_memory", "delete_memory", "search_memory"
+    ]
+    create = tools[0].call({
+        "name": "bound", "description": "same directory", "type": "project", "content": "yes"
+    }, None)
+    assert create.ok
+    assert (tmp_path / "bound.md").is_file()

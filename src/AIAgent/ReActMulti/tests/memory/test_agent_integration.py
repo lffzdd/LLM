@@ -56,6 +56,15 @@ class SelectorLLM:
         yield ContentDone(content=json.dumps(payload, ensure_ascii=False), reasoning="")
 
 
+class EmptySelectorLLM:
+    def __call__(self, messages):
+        yield ContentDone(content=json.dumps({
+            "selected_memories": [],
+            "selected_episodes": [],
+            "memories": [],
+        }), reasoning="")
+
+
 def test_agent_recall_injection_and_extraction(tmp_path: Path):
     # 预置一条记忆,供召回选中
     write_memory_file(
@@ -88,6 +97,13 @@ def test_agent_recall_injection_and_extraction(tmp_path: Path):
     assert (tmp_path / "session-fact.md").is_file()
     assert "session-fact" in (tmp_path / "MEMORY.md").read_text(encoding="utf-8")
 
+    # 4) 同一个 user turn 自动形成独立 episode；语义扫描不会把它当成 markdown 记忆
+    episodes = manager.episode_store.list()
+    assert len(episodes) == 1
+    assert episodes[0].goal == "我该用什么包管理器"
+    assert episodes[0].status == "completed"
+    assert episodes[0].outcome == "done"
+
 
 def test_agent_without_memory_unaffected(tmp_path: Path):
     """memory=None 时:无记忆段、无召回注入,行为与原 Agent 一致。"""
@@ -98,3 +114,31 @@ def test_agent_without_memory_unaffected(tmp_path: Path):
     wire = [r.message for r in session.message_records]
     assert "长期记忆" not in wire[0]["content"]
     assert not any("<system-reminder>" in str(m.get("content", "")) for m in wire)
+
+
+def test_new_user_turn_resets_plan_and_episode_does_not_inherit_old_plan(tmp_path: Path):
+    manager = MemoryManager(MainLLM(), selector_llm=EmptySelectorLLM(), directory=tmp_path)
+    session = SessionState.create(user_goal="t", workspace_dir=tmp_path)
+    session.plan_manager.create_plan("first task", ["finish first"])
+    session.plan_manager.update_step("step_1", "completed")
+    agent = Agent(MainLLM(), [], session, SilentRenderer(), memory=manager)
+
+    assert agent.run("first") == "done"
+    assert agent.run("second") == "done"
+
+    episodes = sorted(manager.episode_store.list(), key=lambda item: item.started_step)
+    assert len(episodes) == 2
+    assert episodes[0].plan["objective"] == "first task"
+    assert episodes[1].plan["status"] == "empty"
+    assert episodes[1].plan["steps"] == []
+
+
+def test_recall_failure_is_best_effort(tmp_path: Path):
+    write_memory_file("context", "forces selector call", "project", "x", directory=tmp_path)
+
+    class BrokenSelector:
+        def __call__(self, messages):
+            raise RuntimeError("selector unavailable")
+
+    manager = MemoryManager(MainLLM(), selector_llm=BrokenSelector(), directory=tmp_path)
+    assert manager.recall_block("query") == ""

@@ -14,6 +14,9 @@ if TYPE_CHECKING:
 
 
 PermissionApprovalHandler = Callable[["PermissionRequest"], "PermissionCheckResult"]
+# 与普通安全权限确认采用同一份 request/result 契约，但语义不同：交互 handler
+# 必须收集用户提供的数据，并以 updated_arguments 回填后才能放行工具调用。
+UserInteractionHandler = PermissionApprovalHandler
 
 
 class PermissionPolicy:
@@ -121,9 +124,11 @@ class PermissionResolver:
         self,
         policy: PermissionPolicy | None = None,
         approval_handler: PermissionApprovalHandler | None = None,
+        interaction_handler: UserInteractionHandler | None = None,
     ):
         self.policy = policy or PermissionPolicy()
         self.approval_handler = approval_handler
+        self.interaction_handler = interaction_handler
 
     def resolve(
         self,
@@ -147,11 +152,19 @@ class PermissionResolver:
         if check.decision != "ask":
             return check
 
-        if self.approval_handler is None:
+        # 对标 Claude Code 的 requiresUserInteraction：即便一般权限规则会放行，
+        # 这种调用仍必须经过专属交互 adapter，拿到回填参数后才能执行。
+        handler = (
+            self.interaction_handler
+            if tool.requires_user_interaction
+            else self.approval_handler
+        )
+        handler_kind = "interaction" if tool.requires_user_interaction else "approval"
+        if handler is None:
             return check
 
         try:
-            decision = self.approval_handler(
+            decision = handler(
                 PermissionRequest(
                     tool_call=tool_call,
                     tool=tool,
@@ -165,17 +178,17 @@ class PermissionResolver:
         except Exception as e:
             return PermissionCheckResult(
                 "deny",
-                f"permission approval handler failed: {type(e).__name__}: {e}",
+                f"permission {handler_kind} handler failed: {type(e).__name__}: {e}",
                 check.risk_flags,
-                source="approval_handler_error",
+                source=f"{handler_kind}_handler_error",
             )
 
         if decision.decision not in ("allow", "deny", "ask"):
             return PermissionCheckResult(
                 "deny",
-                f"permission approval handler returned invalid decision: {decision.decision!r}",
+                f"permission {handler_kind} handler returned invalid decision: {decision.decision!r}",
                 check.risk_flags,
-                source="approval_handler_error",
+                source=f"{handler_kind}_handler_error",
             )
 
         merged_flags = tuple(dict.fromkeys((*check.risk_flags, *decision.risk_flags)))

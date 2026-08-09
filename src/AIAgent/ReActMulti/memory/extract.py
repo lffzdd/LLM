@@ -13,7 +13,14 @@ from typing import Any
 from ..llm import LLMClient
 from ..logger import get_logger
 from .llm_util import side_query
-from .store import format_manifest, rebuild_index, scan_memory_files, write_memory_file
+from .store import (
+    MemoryStoreError,
+    create_memory,
+    format_manifest,
+    scan_memory_files,
+    slugify,
+    update_memory,
+)
 from .types import MEMORY_TYPES, TYPES_SECTION, WHAT_NOT_TO_SAVE
 
 logger = get_logger(__name__)
@@ -30,21 +37,26 @@ EXTRACT_SYSTEM_PROMPT = f"""你在一段 AI Agent 与用户的对话结束后,�
 请只提取明显值得保留的内容,挑剔、克制。对每条已存在的相似记忆,优先 update 而非新建。
 若这段对话没有任何值得长期保留的东西,返回空列表。
 
+update 时必须把已有清单中的文件 id 放进 memory_id；create 时不要填写 memory_id。
 只输出严格 JSON,格式:
 {{"memories": [
-  {{"name": "短横线-kebab-名", "description": "一句话描述", "type": "{' | '.join(MEMORY_TYPES)}",
+  {{"memory_id": "已有-id（仅 update）", "name": "简短主题名", "description": "一句话描述", "type": "{' | '.join(MEMORY_TYPES)}",
     "content": "记忆正文(feedback/project 请含 Why 和 How to apply)", "action": "create | update | skip"}}
 ]}}"""
 
 
 def _build_transcript(session_state: Any) -> str:
-    """从 wire 消息拼出有界 transcript(取尾部)。"""
+    """只提取当前 user turn，避免多轮 REPL 反复学习旧内容。"""
     parts: list[str] = []
-    for record in getattr(session_state, "message_records", []):
+    records = getattr(session_state, "message_records", [])
+    start = int(getattr(session_state, "active_turn_start_message_index", 0))
+    for record in records[start:]:
         msg = record.message
         role = msg.get("role")
         content = msg.get("content")
         if role not in ("user", "assistant") or not isinstance(content, str):
+            continue
+        if content.lstrip().startswith("<system-reminder>"):
             continue
         parts.append(f"[{role}] {content}")
     text = "\n".join(parts)
@@ -82,7 +94,8 @@ def extract_and_save(
     for item in memories:
         if not isinstance(item, dict):
             continue
-        if item.get("action") == "skip":
+        action = item.get("action")
+        if action == "skip":
             continue
         name = item.get("name")
         type_ = item.get("type")
@@ -90,20 +103,27 @@ def extract_and_save(
         if not (name and content and type_ in MEMORY_TYPES):
             continue
         try:
-            write_memory_file(
-                name=str(name),
-                description=str(item.get("description") or ""),
-                type_=str(type_),
-                content=str(content),
-                directory=directory,
-            )
+            if action == "create":
+                create_memory(
+                    name=str(name),
+                    description=str(item.get("description") or ""),
+                    type_=str(type_),
+                    content=str(content),
+                    directory=directory,
+                )
+            elif action == "update":
+                memory_id = item.get("memory_id") or slugify(str(name))
+                update_memory(
+                    str(memory_id),
+                    name=str(name),
+                    description=str(item.get("description") or ""),
+                    type_=str(type_),
+                    content=str(content),
+                    directory=directory,
+                )
+            else:
+                continue
             written += 1
-        except OSError as e:
+        except (OSError, MemoryStoreError) as e:
             logger.debug("写记忆文件失败 (%s): %s", name, e)
-
-    if written:
-        try:
-            rebuild_index(directory)
-        except OSError as e:
-            logger.debug("重建索引失败: %s", e)
     return written

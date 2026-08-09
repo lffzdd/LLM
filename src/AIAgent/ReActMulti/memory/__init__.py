@@ -5,11 +5,14 @@
 """
 
 from .manager import MemoryManager
+from .episode import EpisodeRecord, EpisodeStore
 from .paths import ensure_memory_dir, memory_dir
 from .types import MEMORY_TYPES, MemoryType
 
 __all__ = [
     "MemoryManager",
+    "EpisodeRecord",
+    "EpisodeStore",
     "ensure_memory_dir",
     "memory_dir",
     "MEMORY_TYPES",
