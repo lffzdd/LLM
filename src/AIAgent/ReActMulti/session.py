@@ -11,6 +11,8 @@ from openai.types.chat import ChatCompletionMessageParam
 
 from .coordination import AgentControlPlane
 from .planning import PlanManager
+from .skills.store import normalize_skill_id
+from .skills.types import MAX_ACTIVE_SKILLS, SkillActivationError, SkillStoreError
 from .tools.base import ToolResult, ToolCall
 from .util import estimate_message_tokens
 
@@ -39,6 +41,8 @@ class SessionState:
     tool_executions: dict[CallId, ToolExecutionRecord]
     background_tasks: dict[str, BackgroundTask]
     plan_manager: PlanManager
+    # 当前 user turn 激活的 skill id。正文仍从磁盘读，不把流程写进 session。
+    active_skill_ids: list[str] = field(default_factory=list)
     # Root 与所有子 Agent 共享同一个控制面；子 session 用 agent_task_id
     # 标记自己在任务树中的位置，root 则为 None。
     control_plane: AgentControlPlane = field(default_factory=AgentControlPlane)
@@ -72,6 +76,9 @@ class SessionState:
     durable_task_store: Any = field(default=None, repr=False, compare=False)
     autonomy_scheduler: Any = field(default=None, repr=False, compare=False)
     loop_registry: Any = field(default=None, repr=False, compare=False)
+    _skills_lock: threading.RLock = field(
+        default_factory=threading.RLock, repr=False
+    )
 
     @classmethod
     def create(
@@ -115,6 +122,45 @@ class SessionState:
     def _next_step(self) -> int:
         self.step_count += 1
         return self.step_count
+
+    def get_active_skill_ids(self) -> list[str]:
+        with self._skills_lock:
+            return list(self.active_skill_ids)
+
+    def reset_active_skills(self) -> None:
+        """新的 user turn 丢弃上一任务加载的 skill，避免流程提示残留。"""
+        with self._skills_lock:
+            self.active_skill_ids = []
+
+    def restore_active_skills(self, skill_ids: list[str]) -> None:
+        with self._skills_lock:
+            self.active_skill_ids = list(skill_ids)
+
+    def activate_skill(self, skill_id: str) -> list[str]:
+        normalized = normalize_skill_id(skill_id)
+        with self._skills_lock:
+            if normalized in self.active_skill_ids:
+                return list(self.active_skill_ids)
+            if len(self.active_skill_ids) >= MAX_ACTIVE_SKILLS:
+                raise SkillActivationError(
+                    f"最多同时激活 {MAX_ACTIVE_SKILLS} 个 skill，"
+                    "请先 unload_skill 再加载新的流程"
+                )
+            self.active_skill_ids.append(normalized)
+            return list(self.active_skill_ids)
+
+    def deactivate_skill(self, skill_id: str) -> bool:
+        try:
+            normalized = normalize_skill_id(skill_id)
+        except SkillStoreError:
+            return False
+        with self._skills_lock:
+            if normalized not in self.active_skill_ids:
+                return False
+            self.active_skill_ids = [
+                item for item in self.active_skill_ids if item != normalized
+            ]
+            return True
 
     def begin_user_turn(self, prompt: str) -> None:
         """记录当前任务目标及其证据边界。"""

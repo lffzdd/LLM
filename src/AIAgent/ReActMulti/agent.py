@@ -14,6 +14,8 @@ from .llm import LLMClient
 from .prompt import build_system_prompt
 from .renderer import Renderer
 from .session import SessionState, UsageRecord
+from .skills.prompt import active_bodies_reminder, catalog_reminder
+from .skills.registry import SkillRegistry
 from .protocol import TurnAbort, parse_turn
 from .tools.base import Tool
 from .util import build_tool_results_message, estimate_message_tokens
@@ -44,6 +46,7 @@ class Agent:
         allow_background_tasks: bool = True,
         on_shell_task_done: Callable[[str], None] | None = None,
         lifecycle=None,
+        skills: SkillRegistry | None = None,
     ):
         self.llm = llm
         self.session_state = session_state
@@ -51,6 +54,8 @@ class Agent:
         # 长期记忆协作者:只主 Agent 注入,子 Agent 传 None(保持纯净隔离上下文)。
         # Agent 只在主循环里喊它三声:构造时取指令、每轮注入召回、收口后提取落盘。
         self.memory = memory
+        # Skill 清单和正文走每轮临时注入，绝不改已经冻结的 system prompt。
+        self.skills = skills
         self.verifier = verifier
         self.max_verification_retries = max_verification_retries
         self.checkpoint_store = checkpoint_store
@@ -216,7 +221,8 @@ class Agent:
         })
 
     def _run_turn(
-        self, plan_reminder: ChatCompletionMessageParam | None = None
+        self,
+        extra_messages: Sequence[ChatCompletionMessageParam] | None = None,
     ) -> tuple[str, UsageRecord | None]:
         """跑一轮 LLM 调用：实时渲染事件流，返回拼接好的完整 content。"""
 
@@ -226,17 +232,19 @@ class Agent:
         usage_record: UsageRecord | None = None
 
         wire_messages = self.session_state.wire_messages()
-        # 当前计划是运行期状态，不永久复制进 transcript。每轮临时放在 wire 尾部，
-        # 即使旧的 create/update 工具结果日后被 context compactor 折叠，模型仍能看到
-        # 最新计划；无计划时完全不改变原消息流。
-        if plan_reminder is not None:
-            wire_messages.append(plan_reminder)
+        # 计划 / skill 都是运行期状态，不永久复制进 transcript。每轮临时放在
+        # wire 尾部；卸载 skill 后下一轮自然消失。空目录时完全不改变原消息流。
+        if extra_messages:
+            wire_messages.extend(extra_messages)
 
         self._emit_lifecycle("llm_start", {
             "model": str(getattr(self.llm, "model", "")),
             "message_count": len(wire_messages),
             "context_tokens": self.session_state.context_tokens,
-            "has_plan_reminder": plan_reminder is not None,
+            "has_plan_reminder": any(
+                "<plan-state>" in str(message.get("content", ""))
+                for message in extra_messages or ()
+            ),
         })
         started = time.monotonic()
         try:
@@ -283,6 +291,32 @@ class Agent:
         # 计划字段由模型工具调用产生，最终也可能来自不可信用户文本；保持 user role，
         # 并由 to_prompt_block 的 JSON 数据边界明确它不具备指令权限。
         return {"role": "user", "content": block} if block else None
+
+    def _skill_reminders(self) -> list[ChatCompletionMessageParam]:
+        if self.skills is None:
+            return []
+        messages: list[ChatCompletionMessageParam] = []
+        catalog = catalog_reminder(self.skills.list_metas())
+        if catalog:
+            messages.append({"role": "user", "content": catalog})
+        definitions = []
+        for skill_id in self.session_state.get_active_skill_ids():
+            try:
+                definitions.append(self.skills.get(skill_id))
+            except Exception:
+                continue
+        bodies = active_bodies_reminder(definitions)
+        if bodies:
+            messages.append({"role": "user", "content": bodies})
+        return messages
+
+    def _ephemeral_reminders(self) -> list[ChatCompletionMessageParam]:
+        reminders: list[ChatCompletionMessageParam] = []
+        plan = self._plan_reminder()
+        if plan is not None:
+            reminders.append(plan)
+        reminders.extend(self._skill_reminders())
+        return reminders
 
     def _record_usage_for_turn(
         self,
@@ -342,10 +376,11 @@ class Agent:
         if max_steps <= 0:
             raise ValueError("max_steps 必须 > 0")
         self.session_state.max_steps = max_steps
-        # Plan 是 user-turn 级状态，不是跨任务记忆。首轮允许装配层预置计划；
-        # 后续 run() 开始新目标时清空旧计划，continue_run() 则原样保留。
+        # Plan / 激活 skill 都是 user-turn 级状态，不是跨任务记忆。
+        # 首轮允许装配层预置；后续 run() 开始新目标时清空，continue_run() 则保留。
         if self.session_state.turns:
             self.session_state.plan_manager.reset()
+            self.session_state.reset_active_skills()
         # 重置上一轮的终态,使 status 始终反映"当前这轮"(多轮 REPL 下尤其需要)。
         self.session_state.mark_running()
         self.session_state.begin_user_turn(prompt)
@@ -532,14 +567,14 @@ class Agent:
         for loop_index in range(max_steps):
             if self._stop_if_cancelled(record_memory=record_memory):
                 return None
-            plan_reminder = self._plan_reminder()
-            transient_plan_tokens = (
-                estimate_message_tokens(plan_reminder) if plan_reminder else 0
+            reminders = self._ephemeral_reminders()
+            transient_plan_tokens = sum(
+                estimate_message_tokens(message) for message in reminders
             )
             self._compact_context_if_needed(transient_plan_tokens)
 
             # ----- 步骤 1：调用 LLM 推理 -----
-            content, usage_record = self._run_turn(plan_reminder)
+            content, usage_record = self._run_turn(reminders)
             # assistant 原文不再在这里手动入队:改由 session 的 record_* 方法
             # 在记账的同时落进 wire,wire 与 turn 原子产生、靠稳定 id 关联。
 

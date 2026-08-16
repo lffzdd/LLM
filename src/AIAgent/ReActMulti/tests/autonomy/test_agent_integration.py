@@ -12,7 +12,11 @@ from ...renderer import SilentRenderer
 from ...session import SessionState
 from ...tools.ask_user_tool import ask_user_tool
 from ...tools.autonomy_tools import autonomy_tools
+from ...tools.knowledge_tools import build_knowledge_tools
 from ...tools.memory_tools import build_memory_tools
+from ...tools.skill_tools import build_skill_tools
+from ...skills.registry import SkillRegistry
+from ...skills.store import write_skill
 
 
 def _final(answer):
@@ -168,12 +172,30 @@ def test_durable_session_omits_ask_user_and_autonomy_tools(tmp_path):
     memory_tools = build_memory_tools(
         tmp_path / "memory", include_legacy_save=True
     )
+    write_skill(
+        tmp_path / "skills",
+        "release-check",
+        name="发布前检查",
+        description="发布时使用",
+        body="先跑测试",
+    )
+
+    class FakeKnowledge:
+        def search(self, query, top_k):
+            return []
+
     launch = launch_durable_run(
         run_id=run_id,
         root_session=session,
         scheduler=scheduler,
         llm=ScriptLLM(["done"]),
-        base_tools=[ask_user_tool, *autonomy_tools, *memory_tools],
+        base_tools=[
+            ask_user_tool,
+            *autonomy_tools,
+            *memory_tools,
+            *build_knowledge_tools(FakeKnowledge()),
+            *build_skill_tools(SkillRegistry(tmp_path / "skills")),
+        ],
         permission_settings=PermissionSettings(),
         background_runtime=background,
     )
@@ -190,6 +212,10 @@ def test_durable_session_omits_ask_user_and_autonomy_tools(tmp_path):
     assert "create_memory" not in names
     assert "search_memory" not in names
     assert "save_memory" not in names
+    assert "knowledge_search" not in names
+    assert "list_skills" not in names
+    assert "load_skill" not in names
+    assert "unload_skill" not in names
     events.get(timeout=2)
     background.shutdown(session.control_plane)
     store.close()

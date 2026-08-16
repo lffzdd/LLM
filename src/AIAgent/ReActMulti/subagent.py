@@ -128,6 +128,7 @@ def _child_base_tools(base_tools: Sequence[Tool]) -> list[Tool]:
             "create_task", "get_schedule", "list_schedules",
             "pause_schedule", "resume_schedule", "cancel_schedule",
             "list_task_runs",
+            "list_skills", "load_skill", "unload_skill",
         }:
             continue
         if tool.name == "execute_command":

@@ -34,6 +34,8 @@ from .scheduler import AutonomyScheduler
 # Durable runs must not ask a human, spawn more schedules, or write memory.
 # Autonomy names are also in ``_child_base_tools``; listed here so the
 # isolation policy stays explicit if that helper changes.
+# knowledge_search 会消耗外部 API 额度并依赖网络；skill 加载会占用步数和上下文。
+# 无人值守任务应把流程写进 prompt，而不是现场发现并加载。
 _DURABLE_EXCLUDED_TOOLS = frozenset({
     "ask_user",
     "create_task",
@@ -52,6 +54,10 @@ _DURABLE_EXCLUDED_TOOLS = frozenset({
     "search_episodes",
     "get_episode",
     "delete_episode",
+    "knowledge_search",
+    "list_skills",
+    "load_skill",
+    "unload_skill",
 })
 
 _UNATTENDED_DENY_NOTE = (

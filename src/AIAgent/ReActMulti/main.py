@@ -22,6 +22,7 @@ from .agent_background import AgentBackgroundRuntime
 from .autonomy import AutonomyScheduler, AutonomyStore, AutonomyStoreError
 from .autonomy.runner import launch_durable_run
 from .checkpoint import CheckpointError, SessionCheckpointStore
+from .knowledge import optional_knowledge_tools
 from .logger import get_logger
 from .memory import MemoryManager
 from .tools import tools as base_tools
@@ -42,6 +43,7 @@ from .permission import (
 )
 from .renderer import ConsoleRenderer
 from .session import SessionState
+from .skills import SkillRegistry, optional_skill_tools
 from .subagent import build_agent_tools
 from .tasks import RuntimeTask, TaskNotFoundError, TaskService
 from .tools.mcp_client import McpManager, load_mcp_config
@@ -376,21 +378,33 @@ if __name__ == "__main__":
 
     # 给主 Agent 装上"基础工具 + spawn_agent"的分层工具集:depth=0 是主 Agent,
     # 它能委派出 depth=1 的子 Agent;到 max_depth 那层不再带 spawn,递归到底。
+    # knowledge_search 是只读检索：启用后放进 base，让子 Agent 也能查知识库。
+    knowledge_tools = optional_knowledge_tools()
+    assembled_base = base_tools + mcp_tools + knowledge_tools
     tools = build_agent_tools(
         llm_client,
-        base_tools + mcp_tools,
+        assembled_base,
         depth=0,
         max_depth=2,
         permission_resolver=permission_resolver,
         enable_autonomy=True,
     )
 
-    # ask_user、loop 与记忆工具只给主 Agent:都在 build_agent_tools 之后【单独追加】，不进
-    # base_tools。子 Agent 不能绕过父 Agent 直接打断人；它若信息不足，应把缺口作为
-    # 结果交回父 Agent，由父 Agent 决定是否询问。子 Agent 也保持无长期记忆的纯净上下文。
+    # ask_user、loop、记忆与 skill 工具只给主 Agent:都在 build_agent_tools 之后
+    # 【单独追加】，不进 base_tools。子 Agent 不能绕过父 Agent 直接打断人；
+    # 它若信息不足，应把缺口作为结果交回父 Agent。子 Agent 也保持无长期记忆、
+    # 无 skill 加载器的纯净上下文——委派时把需要的流程写进任务描述。
     # loop 同理：会话内重跑必须看见当前对话，不能下放到隔离的子 Agent。
     memory_manager = MemoryManager(llm_client, selector_llm=selector_llm)
-    tools = [*tools, ask_user_tool, loop_tool, *memory_manager.tools()]
+    skill_registry = SkillRegistry(workspace_dir / "skills")
+    skill_tools = optional_skill_tools(skill_registry)
+    tools = [
+        *tools,
+        ask_user_tool,
+        loop_tool,
+        *memory_manager.tools(),
+        *skill_tools,
+    ]
 
     agent = Agent(
         llm_client,
@@ -404,6 +418,7 @@ if __name__ == "__main__":
         checkpoint_store=(None if args.no_session_persistence else checkpoint_store),
         on_shell_task_done=lambda task_id: event_queue.put(("TASK_DONE", task_id)),
         lifecycle=lifecycle,
+        skills=skill_registry if skill_tools else None,
     )
 
     autonomy_scheduler.start()
@@ -498,7 +513,7 @@ if __name__ == "__main__":
                         root_session=session_state,
                         scheduler=autonomy_scheduler,
                         llm=llm_client,
-                        base_tools=base_tools + mcp_tools,
+                        base_tools=assembled_base,
                         permission_settings=settings,
                         background_runtime=background_runtime,
                         lifecycle=lifecycle,

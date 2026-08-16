@@ -21,6 +21,8 @@ from .session import (
     UsageRecord,
     VerificationRecord,
 )
+from .skills.store import normalize_skill_id
+from .skills.types import MAX_ACTIVE_SKILLS, SkillStoreError
 from .tools.base import ToolCall, ToolResult
 from .util import build_tool_results_message
 
@@ -181,6 +183,7 @@ def _serialize_session(session: SessionState) -> dict[str, Any]:
                 for call_id, execution in session.tool_executions.items()
             },
             "plan": session.plan_manager.snapshot(),
+            "active_skill_ids": session.get_active_skill_ids(),
             "agent_control": session.control_plane.snapshot(),
             "agent_task_id": session.agent_task_id,
             "agent_root_turn_id": session.agent_root_turn_id,
@@ -254,6 +257,7 @@ def _deserialize_session(payload: Any) -> SessionState:
     turns = _deserialize_turns(data.get("turns"))
     tool_executions = _deserialize_executions(data.get("tool_executions"))
     plan_manager = PlanManager.from_snapshot(_object(data.get("plan"), "plan"))
+    active_skill_ids = _deserialize_skill_ids(data.get("active_skill_ids"))
     try:
         control_plane = AgentControlPlane.from_snapshot(
             data.get("agent_control", {}), mark_interrupted=True
@@ -306,6 +310,7 @@ def _deserialize_session(payload: Any) -> SessionState:
         # execution history is restored; live background process handles are not.
         background_tasks={},
         plan_manager=plan_manager,
+        active_skill_ids=active_skill_ids,
         control_plane=control_plane,
         agent_task_id=agent_task_id,
         agent_root_turn_id=agent_root_turn_id,
@@ -350,6 +355,29 @@ def _recover_interrupted_tool_calls(session: SessionState) -> None:
             execution.status = "failed"
             call_results.append((execution.call, result))
         session.append_message(build_tool_results_message(call_results))
+
+
+def _deserialize_skill_ids(value: Any) -> list[str]:
+    # 旧 checkpoint 没有该字段：当成未激活任何 skill，而不是拒绝恢复。
+    if value is None:
+        return []
+    rows = _array(value, "active_skill_ids")
+    skill_ids: list[str] = []
+    for index, item in enumerate(rows):
+        raw = _string(item, f"active_skill_ids[{index}]")
+        try:
+            skill_id = normalize_skill_id(raw)
+        except SkillStoreError as exc:
+            raise CheckpointError(
+                f"active_skill_ids[{index}] 非法: {exc}"
+            ) from exc
+        if skill_id not in skill_ids:
+            skill_ids.append(skill_id)
+    if len(skill_ids) > MAX_ACTIVE_SKILLS:
+        raise CheckpointError(
+            f"active_skill_ids 不能超过 {MAX_ACTIVE_SKILLS} 个"
+        )
+    return skill_ids
 
 
 def _deserialize_messages(value: Any) -> list[MessageRecord]:
