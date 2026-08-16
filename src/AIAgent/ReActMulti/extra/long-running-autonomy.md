@@ -32,9 +32,12 @@ queued → dispatched → running → completed
 Scheduler 线程只做四件事：检查触发条件、写 durable run、原子 claim、向 REPL 投递
 `DURABLE_RUN_DUE(run_id)`。它从不调用 `Agent.run`，也不修改 root transcript。
 
-REPL 主线程收到事件后启动独立自治回合。自治回合会建立新的 user-goal、Plan、Verifier、
-Memory 和 checkpoint 边界，而普通 `task_notification` 仍只追加到其所属的当前回合。
-同一 Session 同时最多 dispatch 一个 durable run，避免多个后台线程并发写会话。
+REPL 主线程收到事件后只构造独立 `SessionState` 并 `background_runtime.submit(...)`，
+然后立刻回到事件循环。Durable session 不继承 root 的 transcript、cwd、plan、status
+或 memory。同一 workspace 同时最多 dispatch 一个 durable run（`max_inflight`，默认 1）；
+提高上限前需要 git worktree 级别的隔离，否则并发 shell 会互相踩。
+
+完成后投递 `DURABLE_RUN_FINISHED`，主线程只渲染一行摘要，不把结果注入 root 上下文。
 
 ## 触发器
 
@@ -50,10 +53,10 @@ Memory 和 checkpoint 边界，而普通 `task_notification` 仍只追加到其�
 
 ## 重启与副作用安全
 
-- `dispatched` 表示事件已入 REPL 队列但 Agent 尚未开始，重启后安全回到 `queued`；
-- checkpoint 中带 `active_durable_run_id` 的 `running` 自治回合沿原 transcript 恢复，
-  中断工具仍遵守“结果未知、先核实、不静默重放”；
-- 没有对应活动 checkpoint 的孤儿 `running`：默认进入 `unknown`；
+- `dispatched` 表示事件已入 REPL 队列但独立 session 尚未 start，重启后安全回到 `queued`；
+- 进程崩溃时后台线程里的 `running` 行由 `store.recover_interrupted` 按 `recovery_policy`
+  处理：`manual`（默认）→ 标 `unknown` 不重放，`retry` → 按 `max_retries` 重排一次。
+  不再沿原 transcript 恢复；durable session 本身不写 checkpoint。这是有意的简化。
 - 只有显式设置 `recovery_policy=retry` 的任务才会按 `max_retries` 和 delay 重试；
 - `cancel_task(run_id)` 对 queued/dispatched 立即终止，对 running 设置取消信号，Agent 和工具
   在正常协作取消边界观察它。

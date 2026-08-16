@@ -1,8 +1,14 @@
 import queue
+import threading
 
 import pytest
 
-from ...autonomy import AutonomyScheduler, AutonomyStore, TriggerSpec
+from ...autonomy import (
+    AutonomyScheduler,
+    AutonomyStore,
+    AutonomyStoreError,
+    TriggerSpec,
+)
 from ...autonomy.triggers import probe_public_web_page
 from ...session import SessionState
 from ...tasks import TaskService
@@ -381,3 +387,201 @@ def test_scheduler_dispatches_one_run_and_stops_until_finished(tmp_path):
     scheduler.finish_run(str(second_run_id), status="completed", result="ok")
     scheduler.close()
     store.close()
+
+
+def test_cancelled_dispatched_run_does_not_block_later_dispatch(tmp_path):
+    store = _store(tmp_path)
+    events = queue.Queue()
+    store.create_automation(
+        name="first",
+        prompt="first",
+        trigger=TriggerSpec(type="once", run_at=0),
+        now=0,
+    )
+    store.create_automation(
+        name="second",
+        prompt="second",
+        trigger=TriggerSpec(type="once", run_at=0),
+        now=0,
+    )
+    scheduler = AutonomyScheduler(store, events, poll_interval=0.01)
+    scheduler.start()
+
+    event_type, first_run_id = events.get(timeout=1)
+    assert event_type == "DURABLE_RUN_DUE"
+    assert store.get_run(str(first_run_id)).status == "dispatched"
+    store.cancel_run(str(first_run_id), "no longer needed")
+    scheduler.notify_changed()
+
+    event_type, second_run_id = events.get(timeout=1)
+    assert event_type == "DURABLE_RUN_DUE"
+    assert str(second_run_id) != str(first_run_id)
+    assert store.get_run(str(first_run_id)).status == "cancelled"
+    store.start_run(str(second_run_id))
+    scheduler.finish_run(str(second_run_id), status="completed", result="ok")
+    scheduler.close()
+    store.close()
+
+
+def test_finish_run_exception_releases_dispatch_gate(tmp_path):
+    store = _store(tmp_path)
+    events = queue.Queue()
+    store.create_automation(
+        name="first",
+        prompt="first",
+        trigger=TriggerSpec(type="once", run_at=0),
+        now=0,
+    )
+    store.create_automation(
+        name="second",
+        prompt="second",
+        trigger=TriggerSpec(type="once", run_at=0),
+        now=0,
+    )
+    scheduler = AutonomyScheduler(store, events, poll_interval=0.01)
+    scheduler.start()
+
+    _, first_run_id = events.get(timeout=1)
+    store.start_run(str(first_run_id))
+    real_finish = store.finish_run
+
+    def finish_then_fail(run_id, **kwargs):
+        real_finish(run_id, **kwargs)
+        raise AutonomyStoreError("simulated post-commit failure")
+
+    store.finish_run = finish_then_fail
+    with pytest.raises(AutonomyStoreError, match="post-commit"):
+        scheduler.finish_run(str(first_run_id), status="completed")
+
+    _, second_run_id = events.get(timeout=1)
+    assert str(second_run_id) != str(first_run_id)
+    assert store.get_run(str(first_run_id)).status == "completed"
+    store.start_run(str(second_run_id))
+    store.finish_run = real_finish
+    scheduler.finish_run(str(second_run_id), status="completed")
+    scheduler.close()
+    store.close()
+
+
+def test_event_trigger_coalesces_while_live_and_replays_after(tmp_path):
+    store = _store(tmp_path)
+    job = store.create_automation(
+        name="webhook",
+        prompt="handle",
+        trigger=TriggerSpec(type="event", event_name="deploy.finished"),
+        now=0,
+    )
+    store.emit_event("deploy.finished", {"n": 1}, now=1)
+    first_ids = store.materialize_due(now=2)
+    assert len(first_ids) == 1
+    store.emit_event("deploy.finished", {"n": 2}, now=3)
+    store.emit_event("deploy.finished", {"n": 3}, now=4)
+    assert store.materialize_due(now=5) == []
+    queued = [
+        run for run in store.list_runs(job.id) if run.status == "queued"
+    ]
+    assert len(queued) == 1
+
+    first = store.claim_next_run(now=5)
+    assert first is not None
+    store.start_run(first.id, now=5)
+    store.finish_run(first.id, status="completed", now=6)
+
+    follow = store.materialize_due(now=7)
+    assert len(follow) == 1
+    payload = store.get_run(follow[0]).trigger_payload
+    assert payload["payload"] == {"n": 3}
+    assert payload["coalesced_count"] == 2
+    assert store.materialize_due(now=8) == []
+    store.close()
+
+
+def test_interval_next_run_at_does_not_drift_with_late_polls(tmp_path):
+    store = _store(tmp_path)
+    automation = store.create_automation(
+        name="interval",
+        prompt="repeat",
+        trigger=TriggerSpec(type="interval", every_seconds=10, start_at=100),
+        now=0,
+    )
+    created = store.materialize_due(now=100.4)
+    assert len(created) == 1
+    assert store.get_automation(automation.id).next_run_at == 110
+    claimed = store.claim_next_run(now=100.4)
+    assert claimed is not None
+    store.start_run(claimed.id, now=100.4)
+    store.finish_run(claimed.id, status="completed", now=100.5)
+
+    store.materialize_due(now=110.4)
+    assert store.get_automation(automation.id).next_run_at == 120
+    claimed = store.claim_next_run(now=110.4)
+    assert claimed is not None
+    store.start_run(claimed.id, now=110.4)
+    store.finish_run(claimed.id, status="completed", now=110.5)
+
+    store.materialize_due(now=120.4)
+    assert store.get_automation(automation.id).next_run_at == 130
+    store.close()
+
+
+def test_interval_skipped_ticks_do_not_update_last_run_at(tmp_path):
+    store = _store(tmp_path)
+    automation = store.create_automation(
+        name="interval",
+        prompt="repeat",
+        trigger=TriggerSpec(type="interval", every_seconds=10, start_at=100),
+        now=0,
+    )
+    store.materialize_due(now=100)
+    assert store.get_automation(automation.id).last_run_at == 100
+    claimed = store.claim_next_run(now=100)
+    assert claimed is not None
+    store.start_run(claimed.id, now=100)
+
+    assert store.materialize_due(now=120) == []
+    skipped = store.get_automation(automation.id)
+    assert skipped.next_run_at == 130
+    assert skipped.last_run_at == 100
+    store.close()
+
+
+def test_hanging_web_probe_does_not_block_other_dispatch(tmp_path):
+    store = _store(tmp_path)
+    events = queue.Queue()
+    released = threading.Event()
+
+    def hanging_probe(url):
+        released.wait(timeout=5)
+        return {"sha256": "hung"}
+
+    store.create_automation(
+        name="watch web",
+        prompt="hang",
+        trigger=TriggerSpec(
+            type="web_change",
+            url="https://example.com",
+            every_seconds=60,
+        ),
+        now=0,
+    )
+    store.create_automation(
+        name="once",
+        prompt="run now",
+        trigger=TriggerSpec(type="once", run_at=0),
+        now=0,
+    )
+    scheduler = AutonomyScheduler(
+        store,
+        events,
+        poll_interval=0.01,
+        web_probe=hanging_probe,
+    )
+    scheduler.start()
+    try:
+        event_type, run_id = events.get(timeout=1)
+        assert event_type == "DURABLE_RUN_DUE"
+        assert store.get_run(str(run_id)).trigger_type == "once"
+    finally:
+        released.set()
+        scheduler.close()
+        store.close()

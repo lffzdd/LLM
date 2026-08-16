@@ -1,12 +1,18 @@
 import json
 import queue
+import time
 
 from ...agent import Agent
+from ...agent_background import AgentBackgroundRuntime
 from ...autonomy import AutonomyScheduler, AutonomyStore, TriggerSpec
+from ...autonomy.runner import launch_durable_run
 from ...events import ContentDone
-from ...main import _execute_durable_run, _resume_durable_run
+from ...permission import PermissionSettings
 from ...renderer import SilentRenderer
 from ...session import SessionState
+from ...tools.ask_user_tool import ask_user_tool
+from ...tools.autonomy_tools import autonomy_tools
+from ...tools.memory_tools import build_memory_tools
 
 
 def _final(answer):
@@ -23,6 +29,18 @@ class ScriptLLM:
         yield ContentDone(_final(self.answers.pop(0)))
 
 
+class SlowLLM:
+    context_limit = 128_000
+
+    def __init__(self, answer, delay=0.2):
+        self.answer = answer
+        self.delay = delay
+
+    def __call__(self, messages):
+        time.sleep(self.delay)
+        yield ContentDone(_final(self.answer))
+
+
 def _runtime(tmp_path):
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -31,106 +49,169 @@ def _runtime(tmp_path):
         session_id="session",
         workspace_dir=workspace,
     )
+    events = queue.Queue()
     session = SessionState.create("interactive", workspace)
     session.session_id = "session"
     session.durable_task_store = store
-    scheduler = AutonomyScheduler(store, queue.Queue(), poll_interval=1)
-    return workspace, store, session, scheduler
+    background = AgentBackgroundRuntime(events, max_workers=1)
+    session.agent_background_runtime = background
+    scheduler = AutonomyScheduler(store, events, poll_interval=1)
+    return workspace, store, session, scheduler, events, background
 
 
-def test_autonomous_event_starts_fresh_turn_and_commits_run(tmp_path):
-    workspace, store, session, scheduler = _runtime(tmp_path)
-    automation = store.create_automation(
-        name="daily review",
-        prompt="review the repository",
+def _claim_run(store, prompt="review the repository", name="daily review"):
+    store.create_automation(
+        name=name,
+        prompt=prompt,
         trigger=TriggerSpec(type="once", run_at=0),
         now=0,
     )
     run_id = store.materialize_due(now=0)[0]
     claimed = store.claim_next_run(now=0)
     assert claimed is not None and claimed.id == run_id
-    agent = Agent(
-        ScriptLLM(["interactive result", "autonomous result"]),
+    return run_id
+
+
+def test_durable_run_leaves_root_session_untouched(tmp_path):
+    workspace, store, session, scheduler, events, background = _runtime(tmp_path)
+    nested = workspace / "nested"
+    nested.mkdir()
+    root_agent = Agent(
+        ScriptLLM(["interactive result"]),
         [],
         session,
         SilentRenderer(),
     )
-    assert agent.run("interactive turn") == "interactive result"
-    previous_root_turn_id = session.agent_root_turn_id
+    assert root_agent.run("interactive turn") == "interactive result"
     session.plan_manager.create_plan("old", ["old step"])
+    session.set_cwd(nested)
+    root_goal = session.user_goal
+    root_plan = session.plan_manager.snapshot()
+    root_len = len(session.message_records)
+    root_cwd = session.get_cwd()
+    root_user_contents = [
+        record.message.get("content")
+        for record in session.message_records
+        if record.message.get("role") == "user"
+    ]
 
-    _execute_durable_run(agent, scheduler, run_id)
+    run_id = _claim_run(store)
+    launch = launch_durable_run(
+        run_id=run_id,
+        root_session=session,
+        scheduler=scheduler,
+        llm=ScriptLLM(["autonomous result"]),
+        base_tools=[],
+        permission_settings=PermissionSettings(),
+        background_runtime=background,
+    )
+    assert launch is not None
+    event_type, finished_id = events.get(timeout=2)
+    assert event_type == "DURABLE_RUN_FINISHED"
+    assert finished_id == run_id
+
+    assert session.user_goal == root_goal
+    assert session.plan_manager.snapshot() == root_plan
+    assert len(session.message_records) == root_len
+    assert session.get_cwd() == root_cwd
+
+    durable_contents = [
+        message.get("content") for message in launch.session.wire_messages()
+    ]
+    for content in root_user_contents:
+        assert content not in durable_contents
 
     run = store.get_run(run_id)
     assert run.status == "completed"
     assert run.result == "autonomous result"
-    assert run.root_turn_id == session.agent_root_turn_id
-    assert run.root_turn_id != previous_root_turn_id
-    assert session.user_goal == "review the repository"
-    assert session.active_durable_run_id is None
-    assert session.plan_manager.snapshot()["steps"] == []
-    assert run.automation_id == automation.id
+    assert run.root_turn_id == f"durable:{run_id}"
+    background.shutdown(session.control_plane)
     store.close()
 
 
-def test_autonomous_run_observes_durable_cancellation_before_llm_call(tmp_path):
-    workspace, store, session, scheduler = _runtime(tmp_path)
-    store.create_automation(
-        name="cancel me",
-        prompt="should not execute",
-        trigger=TriggerSpec(type="once", run_at=0),
-        now=0,
+def test_durable_run_does_not_block_root_user_input(tmp_path):
+    workspace, store, session, scheduler, events, background = _runtime(tmp_path)
+    run_id = _claim_run(store, prompt="slow work")
+    started = time.monotonic()
+    launch = launch_durable_run(
+        run_id=run_id,
+        root_session=session,
+        scheduler=scheduler,
+        llm=SlowLLM("autonomous result"),
+        base_tools=[],
+        permission_settings=PermissionSettings(),
+        background_runtime=background,
     )
-    run_id = store.materialize_due(now=0)[0]
-    store.claim_next_run(now=0)
-    store.cancel_run(run_id, "external cancellation")
-    agent = Agent(
-        ScriptLLM([]),
+    assert launch is not None
+    assert time.monotonic() - started < 0.08
+
+    root_agent = Agent(
+        ScriptLLM(["user heard"]),
         [],
         session,
         SilentRenderer(),
     )
+    assert root_agent.run("please keep chatting") == "user heard"
+    assert session.user_goal == "please keep chatting"
 
-    _execute_durable_run(agent, scheduler, run_id)
+    event_type, finished_id = events.get(timeout=2)
+    assert event_type == "DURABLE_RUN_FINISHED"
+    assert finished_id == run_id
+    assert store.get_run(run_id).status == "completed"
+    background.shutdown(session.control_plane)
+    store.close()
 
+
+def test_durable_session_omits_ask_user_and_autonomy_tools(tmp_path):
+    workspace, store, session, scheduler, events, background = _runtime(tmp_path)
+    run_id = _claim_run(store)
+    memory_tools = build_memory_tools(
+        tmp_path / "memory", include_legacy_save=True
+    )
+    launch = launch_durable_run(
+        run_id=run_id,
+        root_session=session,
+        scheduler=scheduler,
+        llm=ScriptLLM(["done"]),
+        base_tools=[ask_user_tool, *autonomy_tools, *memory_tools],
+        permission_settings=PermissionSettings(),
+        background_runtime=background,
+    )
+    assert launch is not None
+    names = set(launch.tool_names)
+    assert "ask_user" not in names
+    assert "create_task" not in names
+    assert "pause_schedule" not in names
+    assert "resume_schedule" not in names
+    assert "cancel_schedule" not in names
+    assert "get_schedule" not in names
+    assert "list_schedules" not in names
+    assert "list_task_runs" not in names
+    assert "create_memory" not in names
+    assert "search_memory" not in names
+    assert "save_memory" not in names
+    events.get(timeout=2)
+    background.shutdown(session.control_plane)
+    store.close()
+
+
+def test_cancelled_dispatched_run_is_not_started(tmp_path):
+    workspace, store, session, scheduler, events, background = _runtime(tmp_path)
+    run_id = _claim_run(store, prompt="should not execute", name="cancel me")
+    store.cancel_run(run_id, "external cancellation")
+    launch = launch_durable_run(
+        run_id=run_id,
+        root_session=session,
+        scheduler=scheduler,
+        llm=ScriptLLM([]),
+        base_tools=[],
+        permission_settings=PermissionSettings(),
+        background_runtime=background,
+    )
+    assert launch is None
     run = store.get_run(run_id)
     assert run.status == "cancelled"
     assert run.cancel_reason == "external cancellation"
     assert session.status == "running"
-    store.close()
-
-
-def test_checkpoint_owned_autonomous_turn_continues_same_run(tmp_path):
-    workspace, store, session, scheduler = _runtime(tmp_path)
-    store.create_automation(
-        name="resume",
-        prompt="continue after restart",
-        trigger=TriggerSpec(type="once", run_at=0),
-        now=0,
-    )
-    run_id = store.materialize_due(now=0)[0]
-    dispatched = store.claim_next_run(now=0)
-    assert dispatched is not None
-    store.start_run(run_id, now=0)
-    agent = Agent(
-        ScriptLLM(["resumed result"]),
-        [],
-        session,
-        SilentRenderer(),
-    )
-    session.active_durable_run_id = run_id
-    session.begin_user_turn("continue after restart")
-    session.append_message({
-        "role": "user",
-        "content": json.dumps({"runtime_event": scheduler.runtime_event(run_id)}),
-    })
-    store.set_run_root_turn(run_id, session.agent_root_turn_id)
-
-    _resume_durable_run(agent, scheduler, run_id)
-
-    run = store.get_run(run_id)
-    assert run.status == "completed"
-    assert run.result == "resumed result"
-    assert run.attempt == 1
-    assert session.active_durable_run_id is None
+    background.shutdown(session.control_plane)
     store.close()

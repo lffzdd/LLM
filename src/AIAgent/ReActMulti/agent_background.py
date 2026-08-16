@@ -25,12 +25,22 @@ class AgentBackgroundRuntime:
         self._lock = threading.RLock()
         self._closed = False
 
-    def submit(self, task_id: str, run: Callable[[], Any], control: AgentControlPlane) -> None:
+    def submit(
+        self,
+        task_id: str,
+        run: Callable[[], Any],
+        control: AgentControlPlane,
+        *,
+        done_event: str = "TASK_DONE",
+        done_payload: Any | None = None,
+    ) -> None:
         with self._lock:
             if self._closed:
                 raise RuntimeError("后台 Agent runtime 已关闭")
             future = self._executor.submit(run)
             self._futures[task_id] = future
+        event_name = done_event
+        payload = task_id if done_payload is None else done_payload
 
         def done(completed: Future) -> None:
             # The lifecycle normally owns finish_task.  Cover executor-level
@@ -50,10 +60,9 @@ class AgentBackgroundRuntime:
                         )
                 record = control.get(task_id)
                 if record.status in {"completed", "failed", "cancelled", "timed_out"}:
-                    # Queue only the stable identity. The root thread resolves
-                    # the common RuntimeTask view through TaskService, exactly
-                    # like shell completion notifications.
-                    self.event_queue.put(("TASK_DONE", task_id))
+                    # Durable runs use DURABLE_RUN_FINISHED so the REPL can
+                    # render a summary without injecting into the root turn.
+                    self.event_queue.put((event_name, payload))
             finally:
                 with self._lock:
                     self._futures.pop(task_id, None)

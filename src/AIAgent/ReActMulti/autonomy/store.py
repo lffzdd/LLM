@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 import json
 import os
 from pathlib import Path
@@ -9,7 +10,7 @@ import secrets
 import sqlite3
 import threading
 import time
-from typing import Any, Iterable
+from typing import Any, Iterable, Iterator
 
 from .models import AutomationRecord, DurableRunRecord, TriggerSpec
 
@@ -36,6 +37,7 @@ class AutonomyStore:
             os.chmod(self.path.parent, 0o700)
         except OSError:
             pass
+        self._closed = False
         self._lock = threading.RLock()
         self._conn = sqlite3.connect(
             self.path,
@@ -43,7 +45,7 @@ class AutonomyStore:
             timeout=10,
         )
         self._conn.row_factory = sqlite3.Row
-        with self._lock, self._conn:
+        with self._write():
             self._conn.execute("PRAGMA foreign_keys = ON")
             self._conn.execute("PRAGMA journal_mode = WAL")
             self._initialize_schema()
@@ -54,7 +56,31 @@ class AutonomyStore:
 
     def close(self) -> None:
         with self._lock:
+            if self._closed:
+                return
+            self._closed = True
             self._conn.close()
+
+    @property
+    def closed(self) -> bool:
+        return self._closed
+
+    def _ensure_open(self) -> None:
+        if self._closed:
+            raise AutonomyStoreError("autonomy store is closed")
+
+    @contextmanager
+    def _read(self) -> Iterator[None]:
+        with self._lock:
+            self._ensure_open()
+            yield
+
+    @contextmanager
+    def _write(self) -> Iterator[None]:
+        with self._lock:
+            self._ensure_open()
+            with self._conn:
+                yield
 
     def _initialize_schema(self) -> None:
         version = int(self._conn.execute("PRAGMA user_version").fetchone()[0])
@@ -160,7 +186,7 @@ class AutonomyStore:
             if trigger.type == "file_change" else {}
         )
         automation_id = f"job_{secrets.token_hex(6)}"
-        with self._lock, self._conn:
+        with self._write():
             self._conn.execute(
                 """
                 INSERT INTO automations (
@@ -179,7 +205,7 @@ class AutonomyStore:
         return self.get_automation(automation_id)
 
     def get_automation(self, automation_id: str) -> AutomationRecord:
-        with self._lock:
+        with self._read():
             row = self._conn.execute(
                 "SELECT * FROM automations WHERE id = ? AND session_id = ?",
                 (automation_id, self.session_id),
@@ -189,7 +215,7 @@ class AutonomyStore:
         return self._automation_from_row(row)
 
     def list_automations(self) -> list[AutomationRecord]:
-        with self._lock:
+        with self._read():
             rows = self._conn.execute(
                 """SELECT * FROM automations WHERE session_id = ?
                    ORDER BY created_at DESC""",
@@ -198,11 +224,17 @@ class AutonomyStore:
         return [self._automation_from_row(row) for row in rows]
 
     def pause_automation(self, automation_id: str) -> AutomationRecord:
+        """Stop materializing new runs; already queued runs may still execute.
+
+        Pause only flips the definition to ``paused``, so ``claim_next_run``
+        will still pick up existing queued/dispatched/waiting_retry rows.
+        Use ``cancel_automation`` to abort those as well.
+        """
         current = self.get_automation(automation_id)
         if current.status != "active":
             return current
         now = time.time()
-        with self._lock, self._conn:
+        with self._write():
             self._conn.execute(
                 """UPDATE automations SET status = 'paused', updated_at = ?
                    WHERE id = ? AND session_id = ?""",
@@ -227,7 +259,7 @@ class AutonomyStore:
             state = self._file_snapshot(current.trigger.path)
         elif current.trigger.type == "web_change":
             state = {}
-        with self._lock, self._conn:
+        with self._write():
             self._conn.execute(
                 """UPDATE automations
                    SET status = 'active', updated_at = ?, next_run_at = ?,
@@ -241,7 +273,7 @@ class AutonomyStore:
         self.get_automation(automation_id)
         now = time.time()
         reason = str(reason)[:1_000]
-        with self._lock, self._conn:
+        with self._write():
             self._conn.execute(
                 """UPDATE automations
                    SET status = 'cancelled', updated_at = ?, next_run_at = NULL
@@ -278,7 +310,7 @@ class AutonomyStore:
         if len(payload_json) > 20_000:
             raise AutonomyStoreError("event payload exceeds 20000 chars")
         now = time.time() if now is None else float(now)
-        with self._lock, self._conn:
+        with self._write():
             cursor = self._conn.execute(
                 """INSERT INTO external_events
                    (session_id, name, payload_json, created_at)
@@ -290,7 +322,7 @@ class AutonomyStore:
     def materialize_due(self, *, now: float | None = None) -> list[str]:
         now = time.time() if now is None else float(now)
         created: list[str] = []
-        with self._lock, self._conn:
+        with self._write():
             rows = self._conn.execute(
                 """SELECT * FROM automations
                    WHERE session_id = ? AND status = 'active'
@@ -304,6 +336,7 @@ class AutonomyStore:
                     due = automation.next_run_at
                     if due is None or due > now:
                         continue
+                    created_run = False
                     if not self._has_live_run_locked(automation.id):
                         created.append(self._insert_run_locked(
                             automation,
@@ -311,6 +344,7 @@ class AutonomyStore:
                             trigger_payload={"scheduled_for": due},
                             now=now,
                         ))
+                        created_run = True
                     if trigger.type == "once":
                         self._conn.execute(
                             """UPDATE automations
@@ -319,11 +353,18 @@ class AutonomyStore:
                             (now, now, automation.id),
                         )
                     else:
-                        next_run = now + float(trigger.every_seconds or 0)
+                        next_run = self._advance_interval(
+                            due, float(trigger.every_seconds), now
+                        )
                         self._conn.execute(
                             """UPDATE automations SET next_run_at = ?,
-                               last_run_at = ?, updated_at = ? WHERE id = ?""",
-                            (next_run, now, now, automation.id),
+                               updated_at = ?,
+                               last_run_at = CASE WHEN ? THEN ? ELSE last_run_at END
+                               WHERE id = ?""",
+                            (
+                                next_run, now, int(created_run), now,
+                                automation.id,
+                            ),
                         )
                 elif trigger.type == "file_change":
                     snapshot = self._file_snapshot(trigger.path)
@@ -367,14 +408,23 @@ class AutonomyStore:
                     automation = self._automation_from_row(row)
                     if automation.trigger.event_name != event["name"]:
                         continue
+                    payload = {
+                        "event_id": int(event["id"]),
+                        "event_name": str(event["name"]),
+                        "payload": _load_object(event["payload_json"]),
+                    }
+                    # Coalesce, but do not lose, events while a previous run
+                    # is live. The event is consumed so it cannot be replayed
+                    # from the log; pending_event holds the merged follow-up.
+                    if self._has_live_run_locked(automation.id):
+                        self._note_pending_event_locked(
+                            automation, payload, now
+                        )
+                        continue
                     created.append(self._insert_run_locked(
                         automation,
                         scheduled_for=float(event["created_at"]),
-                        trigger_payload={
-                            "event_id": int(event["id"]),
-                            "event_name": str(event["name"]),
-                            "payload": _load_object(event["payload_json"]),
-                        },
+                        trigger_payload=payload,
                         now=now,
                     ))
                     self._conn.execute(
@@ -386,6 +436,7 @@ class AutonomyStore:
                     "UPDATE external_events SET consumed_at = ? WHERE id = ?",
                     (now, int(event["id"])),
                 )
+            self._flush_pending_events_locked(created, now)
         return created
 
     def list_due_web_probes(
@@ -393,7 +444,7 @@ class AutonomyStore:
     ) -> list[AutomationRecord]:
         """Read due probes; network work intentionally happens outside DB locks."""
         now = time.time() if now is None else float(now)
-        with self._lock:
+        with self._read():
             rows = self._conn.execute(
                 """SELECT * FROM automations
                    WHERE session_id = ? AND status = 'active'
@@ -415,7 +466,7 @@ class AutonomyStore:
         if len(snapshot_json) > 20_000:
             raise AutonomyStoreError("web probe snapshot exceeds 20000 chars")
         now = time.time() if now is None else float(now)
-        with self._lock, self._conn:
+        with self._write():
             row = self._conn.execute(
                 """SELECT * FROM automations
                    WHERE id = ? AND session_id = ? AND status = 'active'
@@ -462,7 +513,7 @@ class AutonomyStore:
         now: float | None = None,
     ) -> None:
         now = time.time() if now is None else float(now)
-        with self._lock, self._conn:
+        with self._write():
             row = self._conn.execute(
                 """SELECT * FROM automations
                    WHERE id = ? AND session_id = ? AND status = 'active'
@@ -484,7 +535,7 @@ class AutonomyStore:
     # -- Concrete durable runs --------------------------------------------------
 
     def get_run(self, run_id: str) -> DurableRunRecord:
-        with self._lock:
+        with self._read():
             row = self._run_query("r.id = ?", (run_id,)).fetchone()
         if row is None:
             raise AutonomyNotFoundError(f"Unknown task_id: {run_id}")
@@ -493,7 +544,7 @@ class AutonomyStore:
     def list_runs(self, automation_id: str | None = None) -> list[DurableRunRecord]:
         if automation_id is not None:
             self.get_automation(automation_id)
-        with self._lock:
+        with self._read():
             if automation_id is None:
                 rows = self._run_query("1 = 1", ()).fetchall()
             else:
@@ -504,7 +555,7 @@ class AutonomyStore:
 
     def claim_next_run(self, *, now: float | None = None) -> DurableRunRecord | None:
         now = time.time() if now is None else float(now)
-        with self._lock, self._conn:
+        with self._write():
             row = self._conn.execute(
                 """SELECT id FROM durable_runs
                    WHERE session_id = ?
@@ -526,11 +577,22 @@ class AutonomyStore:
                 return None
         return self.get_run(run_id)
 
+    def count_active_runs(self) -> int:
+        """Count runs occupying the scheduler dispatch slot for this session."""
+        with self._read():
+            row = self._conn.execute(
+                """SELECT COUNT(*) AS n FROM durable_runs
+                   WHERE session_id = ?
+                     AND status IN ('dispatched', 'running')""",
+                (self.session_id,),
+            ).fetchone()
+        return int(row["n"])
+
     def start_run(
         self, run_id: str, *, now: float | None = None
     ) -> DurableRunRecord:
         now = time.time() if now is None else float(now)
-        with self._lock, self._conn:
+        with self._write():
             cursor = self._conn.execute(
                 """UPDATE durable_runs
                    SET status = 'running', attempt = attempt + 1,
@@ -549,7 +611,7 @@ class AutonomyStore:
 
     def set_run_root_turn(self, run_id: str, root_turn_id: str) -> DurableRunRecord:
         self.get_run(run_id)
-        with self._lock, self._conn:
+        with self._write():
             self._conn.execute(
                 "UPDATE durable_runs SET root_turn_id = ? WHERE id = ?",
                 (str(root_turn_id)[:180], run_id),
@@ -562,7 +624,7 @@ class AutonomyStore:
             return current
         now = time.time()
         reason = str(reason)[:1_000]
-        with self._lock, self._conn:
+        with self._write():
             if current.status in {"queued", "dispatched", "waiting_retry"}:
                 self._conn.execute(
                     """UPDATE durable_runs
@@ -612,7 +674,7 @@ class AutonomyStore:
             and automation.recovery_policy == "retry"
             and current.attempt <= current.max_retries
         )
-        with self._lock, self._conn:
+        with self._write():
             if should_retry:
                 self._conn.execute(
                     """UPDATE durable_runs
@@ -642,7 +704,7 @@ class AutonomyStore:
         now = time.time() if now is None else float(now)
         protected = set(active_run_ids)
         recovered: list[str] = []
-        with self._lock, self._conn:
+        with self._write():
             dispatched = self._conn.execute(
                 """SELECT id FROM durable_runs
                    WHERE session_id = ? AND status = 'dispatched'""",
@@ -717,6 +779,10 @@ class AutonomyStore:
 
     @staticmethod
     def _initial_next_run(trigger: TriggerSpec, now: float) -> float | None:
+        # next_run_at is persisted as wall-clock epoch seconds. A backward
+        # clock step therefore delays every interval until wall time catches
+        # up; a monotonic clock cannot replace this without changing on-disk
+        # semantics.
         if trigger.type == "once":
             return float(trigger.run_at or 0)
         if trigger.type == "interval":
@@ -728,6 +794,14 @@ class AutonomyStore:
         if trigger.type == "web_change":
             return now
         return None
+
+    @staticmethod
+    def _advance_interval(due: float, every_seconds: float, now: float) -> float:
+        next_run = float(due)
+        step = float(every_seconds)
+        while next_run <= now:
+            next_run += step
+        return next_run
 
     @staticmethod
     def _resume_next_run(trigger: TriggerSpec, now: float) -> float | None:
@@ -759,6 +833,57 @@ class AutonomyStore:
             (automation_id,),
         ).fetchone()
         return row is not None
+
+    def _note_pending_event_locked(
+        self,
+        automation: AutomationRecord,
+        payload: dict[str, Any],
+        now: float,
+    ) -> None:
+        state = dict(automation.trigger_state)
+        pending = dict(state.get("pending_event") or {})
+        count = int(pending.get("count") or 0) + 1
+        state["pending_event"] = {**payload, "count": count}
+        self._conn.execute(
+            """UPDATE automations SET trigger_state_json = ?, updated_at = ?
+               WHERE id = ?""",
+            (_dump(state), now, automation.id),
+        )
+
+    def _flush_pending_events_locked(
+        self, created: list[str], now: float
+    ) -> None:
+        rows = self._conn.execute(
+            """SELECT * FROM automations
+               WHERE session_id = ? AND status = 'active'
+                 AND trigger_type = 'event'""",
+            (self.session_id,),
+        ).fetchall()
+        for row in rows:
+            automation = self._automation_from_row(row)
+            pending = automation.trigger_state.get("pending_event")
+            if not isinstance(pending, dict) or not pending:
+                continue
+            if self._has_live_run_locked(automation.id):
+                continue
+            created.append(self._insert_run_locked(
+                automation,
+                scheduled_for=now,
+                trigger_payload={
+                    "event_id": pending.get("event_id"),
+                    "event_name": pending.get("event_name"),
+                    "payload": pending.get("payload") or {},
+                    "coalesced_count": int(pending.get("count") or 1),
+                },
+                now=now,
+            ))
+            state = dict(automation.trigger_state)
+            state.pop("pending_event", None)
+            self._conn.execute(
+                """UPDATE automations SET trigger_state_json = ?,
+                   last_run_at = ?, updated_at = ? WHERE id = ?""",
+                (_dump(state), now, now, automation.id),
+            )
 
     def _insert_run_locked(
         self,

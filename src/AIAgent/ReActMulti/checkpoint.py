@@ -184,7 +184,6 @@ def _serialize_session(session: SessionState) -> dict[str, Any]:
             "agent_control": session.control_plane.snapshot(),
             "agent_task_id": session.agent_task_id,
             "agent_root_turn_id": session.agent_root_turn_id,
-            "active_durable_run_id": session.active_durable_run_id,
             "last_usage": _serialize_usage(session.last_usage),
             "total_usage": _serialize_usage(session.total_usage),
             "context_tokens": session.context_tokens,
@@ -267,11 +266,6 @@ def _deserialize_session(payload: Any) -> SessionState:
     agent_root_turn_id = data.get("agent_root_turn_id", "")
     if not isinstance(agent_root_turn_id, str):
         raise CheckpointError("agent_root_turn_id 必须是字符串")
-    active_durable_run_id = data.get("active_durable_run_id")
-    if active_durable_run_id is not None and not isinstance(
-        active_durable_run_id, str
-    ):
-        raise CheckpointError("active_durable_run_id 必须是字符串或 null")
 
     step_count = _nonnegative_int(data.get("step_count"), "step_count")
     active_turn_start_step = _nonnegative_int(
@@ -315,7 +309,6 @@ def _deserialize_session(payload: Any) -> SessionState:
         control_plane=control_plane,
         agent_task_id=agent_task_id,
         agent_root_turn_id=agent_root_turn_id,
-        active_durable_run_id=active_durable_run_id,
         active_turn_start_step=active_turn_start_step,
         active_turn_start_message_index=active_turn_start_message_index,
         last_usage=_deserialize_usage(data.get("last_usage"), "last_usage"),

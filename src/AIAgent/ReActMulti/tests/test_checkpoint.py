@@ -93,19 +93,18 @@ def test_restored_plan_continues_step_ids_without_collision(tmp_path):
     assert restored.plan_manager.snapshot()["steps"][0]["id"] == "step_1"
 
 
-def test_checkpoint_preserves_active_durable_run_owner(tmp_path):
+def test_checkpoint_does_not_restore_live_autonomy_handles(tmp_path):
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     session = SessionState.create("autonomous", workspace)
-    session.active_durable_run_id = "run_abc123"
     store = SessionCheckpointStore(tmp_path / "checkpoints")
 
     store.save(session)
     restored = store.load(session.session_id)
 
-    assert restored.active_durable_run_id == "run_abc123"
     assert restored.durable_task_store is None
     assert restored.autonomy_scheduler is None
+    assert restored.loop_registry is None
 
 
 def test_unknown_checkpoint_version_is_rejected(tmp_path):

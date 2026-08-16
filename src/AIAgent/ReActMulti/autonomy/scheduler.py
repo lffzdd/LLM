@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import json
 import queue
 import threading
 from typing import Any, Callable
 
-from .models import DurableRunRecord
+from .models import AutomationRecord, DurableRunRecord
 from .store import AutonomyStore, AutonomyStoreError
 from .triggers import probe_public_web_page
 
@@ -16,7 +17,8 @@ class AutonomyScheduler:
     """Owns trigger polling, never Agent/session mutation.
 
     The scheduler writes durable state and puts ``DURABLE_RUN_DUE`` into the
-    root event queue.  The REPL remains the only thread allowed to run Agent.
+    root event queue.  Only the REPL thread constructs a durable session;
+    workers then run it in isolation.
     """
 
     def __init__(
@@ -26,33 +28,36 @@ class AutonomyScheduler:
         *,
         poll_interval: float = 0.5,
         web_probe: Callable[[str], dict[str, Any]] | None = None,
+        # Default 1: concurrent durable sessions share one workspace and would
+        # race on the same files/shell. Raise this only with git worktree
+        # isolation.
+        max_inflight: int = 1,
     ) -> None:
         if poll_interval <= 0:
             raise ValueError("poll_interval must be > 0")
+        if max_inflight < 1:
+            raise ValueError("max_inflight must be >= 1")
         self.store = store
         self.event_queue = event_queue
         self.poll_interval = float(poll_interval)
         self.web_probe = web_probe or probe_public_web_page
+        self.max_inflight = int(max_inflight)
         self._wake = threading.Event()
         self._lock = threading.RLock()
-        self._inflight: set[str] = set()
         self._thread: threading.Thread | None = None
+        self._web_executor: ThreadPoolExecutor | None = None
+        self._web_inflight: set[str] = set()
         self._closed = False
 
-    def start(self, *, active_run_id: str | None = None) -> None:
+    def start(self) -> None:
         with self._lock:
             if self._thread is not None:
                 return
-            protected: list[str] = []
-            if active_run_id:
-                try:
-                    active = self.store.get_run(active_run_id)
-                except AutonomyStoreError:
-                    active = None
-                if active is not None and active.status == "running":
-                    protected.append(active_run_id)
-                    self._inflight.add(active_run_id)
-            self.store.recover_interrupted(active_run_ids=protected)
+            self.store.recover_interrupted()
+            self._web_executor = ThreadPoolExecutor(
+                max_workers=4,
+                thread_name_prefix="react-autonomy-web",
+            )
             self._thread = threading.Thread(
                 target=self._run,
                 name="react-autonomy-scheduler",
@@ -61,12 +66,17 @@ class AutonomyScheduler:
             self._thread.start()
 
     def close(self, *, timeout: float = 6.0) -> None:
+        executor: ThreadPoolExecutor | None = None
         with self._lock:
             if self._closed:
                 return
             self._closed = True
             thread = self._thread
+            executor = self._web_executor
+            self._web_executor = None
         self._wake.set()
+        if executor is not None:
+            executor.shutdown(wait=False, cancel_futures=True)
         if thread is not None:
             thread.join(timeout=timeout)
 
@@ -86,16 +96,15 @@ class AutonomyScheduler:
         result: str = "",
         error: str = "",
     ) -> DurableRunRecord:
-        record = self.store.finish_run(
-            run_id,
-            status=status,
-            result=result,
-            error=error,
-        )
-        with self._lock:
-            self._inflight.discard(run_id)
-        self.notify_changed()
-        return record
+        try:
+            return self.store.finish_run(
+                run_id,
+                status=status,
+                result=result,
+                error=error,
+            )
+        finally:
+            self.notify_changed()
 
     def runtime_event(self, run_id: str) -> dict[str, Any]:
         run = self.store.get_run(run_id)
@@ -125,22 +134,25 @@ class AutonomyScheduler:
 
     def _run(self) -> None:
         while True:
+            self._wake.clear()
             with self._lock:
                 if self._closed:
                     return
-                has_inflight = bool(self._inflight)
             try:
+                if self.store.closed:
+                    return
                 self.store.materialize_due()
                 self._poll_web_changes()
-                if not has_inflight:
+                if self.store.count_active_runs() < self.max_inflight:
                     run = self.store.claim_next_run()
                     if run is not None:
                         with self._lock:
                             if self._closed:
                                 return
-                            self._inflight.add(run.id)
                         self.event_queue.put(("DURABLE_RUN_DUE", run.id))
             except Exception as exc:
+                if self._closed or self.store.closed:
+                    return
                 # Scheduler failures must be observable but cannot kill the
                 # input/Agent loop. The root thread decides how to render them.
                 self.event_queue.put((
@@ -148,19 +160,48 @@ class AutonomyScheduler:
                     f"{type(exc).__name__}: {exc}",
                 ))
             self._wake.wait(timeout=self.poll_interval)
-            self._wake.clear()
 
     def _poll_web_changes(self) -> None:
+        executor = self._web_executor
+        if executor is None or self._closed:
+            return
         for automation in self.store.list_due_web_probes():
+            with self._lock:
+                if self._closed:
+                    return
+                if automation.id in self._web_inflight:
+                    continue
+                self._web_inflight.add(automation.id)
             try:
-                snapshot = self.web_probe(automation.trigger.url)
-                self.store.record_web_probe(automation.id, snapshot)
-            except Exception as exc:
+                executor.submit(self._probe_web, automation)
+            except RuntimeError:
+                with self._lock:
+                    self._web_inflight.discard(automation.id)
+                return
+
+    def _probe_web(self, automation: AutomationRecord) -> None:
+        try:
+            if self._closed or self.store.closed:
+                return
+            snapshot = self.web_probe(automation.trigger.url)
+            if self._closed or self.store.closed:
+                return
+            self.store.record_web_probe(automation.id, snapshot)
+            self.notify_changed()
+        except Exception as exc:
+            if self._closed or self.store.closed:
+                return
+            try:
                 self.store.defer_web_probe(
                     automation.id, f"{type(exc).__name__}: {exc}"
                 )
-                self.event_queue.put((
-                    "AUTONOMY_ERROR",
-                    f"web trigger {automation.id} probe failed: "
-                    f"{type(exc).__name__}: {exc}",
-                ))
+            except AutonomyStoreError:
+                return
+            self.event_queue.put((
+                "AUTONOMY_ERROR",
+                f"web trigger {automation.id} probe failed: "
+                f"{type(exc).__name__}: {exc}",
+            ))
+        finally:
+            with self._lock:
+                self._web_inflight.discard(automation.id)

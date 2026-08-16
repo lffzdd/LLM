@@ -218,10 +218,14 @@ _TRIGGER_SCHEMA = {
 create_task_tool = Tool(
     name="create_task",
     description=(
-        "Create a durable autonomous task. Trigger types: once (delay_seconds or "
-        "epoch run_at), interval, file_change inside workspace, web_change for a "
-        "public HTTP(S) page, or named external event. "
-        "The task survives process restart; recovery defaults to manual/no blind replay."
+        "Create a durable autonomous task that runs in an isolated session. "
+        "It cannot see the current conversation, user goal, plan, or transcript. "
+        "Use this for work that must survive process restart or must not share "
+        "the live dialogue. Trigger types: once (delay_seconds or epoch run_at), "
+        "interval, file_change inside workspace, web_change for a public HTTP(S) "
+        "page, or named external event. Recovery defaults to manual/no blind replay. "
+        "For recurring checks that should see the current conversation and die "
+        "with this session, use the loop tool or /loop instead."
     ),
     parameters={
         "type": "object",

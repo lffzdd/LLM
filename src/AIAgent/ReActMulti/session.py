@@ -44,10 +44,6 @@ class SessionState:
     control_plane: AgentControlPlane = field(default_factory=AgentControlPlane)
     agent_task_id: str | None = None
     agent_root_turn_id: str = ""
-    # Concrete durable run currently owning the root autonomous turn. The id
-    # is checkpointed so a restarted process can resume the transcript instead
-    # of blindly replaying the scheduled task from scratch.
-    active_durable_run_id: str | None = None
     # 当前 user turn 从哪个全局 step 之后开始。Verifier 用它隔离多轮 REPL 中
     # 旧任务的工具证据；checkpoint/resume 也靠它恢复本轮边界。
     active_turn_start_step: int = 0
@@ -75,6 +71,7 @@ class SessionState:
     agent_background_runtime: Any = field(default=None, repr=False, compare=False)
     durable_task_store: Any = field(default=None, repr=False, compare=False)
     autonomy_scheduler: Any = field(default=None, repr=False, compare=False)
+    loop_registry: Any = field(default=None, repr=False, compare=False)
 
     @classmethod
     def create(
