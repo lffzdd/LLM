@@ -5,8 +5,9 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
+from ..processes import terminate_process_tree
 from .base import Tool, ToolCancelledError, ToolResult, ToolRuntime
 from .command_permissions import (
     check_execute_command_permission,
@@ -26,30 +27,47 @@ def _make_background_task(
     output_lines: list[str],
     done_event: threading.Event,
     output_lock: threading.RLock,
+    *,
+    command: str,
+    root_turn_id: str,
+    on_done: Callable[[], None] | None = None,
 ):
     # 延迟导入避免 session -> tools.base -> tools.__init__ -> command_tools 的环。
     from ..session import BackgroundTask
 
-    return BackgroundTask(task_id, proc, output_lines, done_event, output_lock)
+    task = BackgroundTask(
+        task_id=task_id,
+        process=proc,
+        output_lines=output_lines,
+        done=done_event,
+        output_lock=output_lock,
+        on_done=on_done,
+        command=command,
+        root_turn_id=root_turn_id,
+    )
+    if done_event.is_set():
+        task.ended_at = time.time()
+    return task
 
 
 def get_task_output(task_id: str, runtime: ToolRuntime | None = None) -> ToolResult:
-    """查询后台任务的当前输出和状态。"""
+    """Compatibility adapter for the old shell-only task query."""
     try:
-        task = _session(runtime).get_background_task(task_id)
+        from ..tasks import TaskNotFoundError, TaskService
+
+        task = TaskService.for_session(_session(runtime)).get(task_id)
+        if task.kind != "shell":
+            return ToolResult.fail(f"Task is not a shell task: {task_id}")
+    except TaskNotFoundError as e:
+        return ToolResult.fail(str(e))
     except Exception as e:
         return ToolResult.fail(str(e))
-    if task is None:
-        return ToolResult.fail(f"Unknown task_id: {task_id}")
-    done = task.done.is_set()
-    with task.output_lock:
-        output = "".join(task.output_lines)
     return ToolResult.success(
         {
             "task_id": task_id,
-            "done": done,
-            "returncode": task.process.returncode if done else None,
-            "output": output[-8000:],
+            "done": task.terminal,
+            "returncode": task.returncode,
+            "output": task.output,
         }
     )
 
@@ -76,6 +94,12 @@ def execute_command(
     """
     try:
         session = _session(runtime)
+        if (
+            run_in_background
+            and runtime is not None
+            and not runtime.allow_background_tasks
+        ):
+            return ToolResult.fail("当前 Agent 不允许创建后台任务")
         cwd = session.get_cwd()
 
         # 注入 cwd 追踪：用临时文件，和 Claude Code 的 claude-{id}-cwd 一致
@@ -96,6 +120,9 @@ def execute_command(
             stderr=subprocess.STDOUT,  # stderr 合并进 stdout，和 Claude Code 一致
             text=True,
             bufsize=1,
+            # A task owns the whole command tree, so cancel_task can terminate
+            # descendants instead of orphaning them.
+            start_new_session=True,
         )
     except FileNotFoundError:
         return ToolResult.fail(
@@ -108,6 +135,26 @@ def execute_command(
     output_lock = threading.RLock()
     done_event = threading.Event()
     cwd_result: list[Path] = []
+
+    # 后台 task 可能在 reader 启动后才创建（前台 timeout 转后台）。holder
+    # 让 reader 在完成时补 ended_at 和通知；极短命令先结束时，注册路径会补发。
+    background_holder: list[Any | None] = [None]
+    notification_lock = threading.Lock()
+    notification_sent = False
+
+    def _notify_background_done() -> None:
+        nonlocal notification_sent
+        task = background_holder[0]
+        if task is None or task.on_done is None:
+            return
+        with notification_lock:
+            if notification_sent:
+                return
+            notification_sent = True
+        try:
+            task.on_done()
+        except Exception:
+            pass
 
     def _reader():
         assert proc.stdout is not None
@@ -122,21 +169,31 @@ def execute_command(
         new_cwd = _consume_cwd_file(cwd_file)
         if new_cwd is not None:
             cwd_result.append(new_cwd)
+        background = background_holder[0]
+        if background is not None:
+            background.ended_at = time.time()
         done_event.set()
+        _notify_background_done()
 
     threading.Thread(target=_reader, daemon=True).start()
 
     if run_in_background:
         task_id = f"task_{uuid.uuid4().hex[:8]}"
-        session.register_background_task(
-            _make_background_task(
-                task_id, proc, output_lines, done_event, output_lock
-            )
+        notify = runtime.notify_background_done if runtime else None
+        background = _make_background_task(
+            task_id, proc, output_lines, done_event, output_lock,
+            command=command,
+            root_turn_id=session.agent_root_turn_id,
+            on_done=(lambda: notify(task_id)) if notify is not None else None,
         )
+        background_holder[0] = background
+        session.register_background_task(background)
+        if done_event.is_set():
+            _notify_background_done()
         return ToolResult.success(
             {
                 "task_id": task_id,
-                "message": f"命令已在后台运行，用 get_task_output('{task_id}') 查结果。",
+                "message": f"命令已在后台运行，用 get_task 查询 {task_id}。",
             }
         )
 
@@ -144,11 +201,7 @@ def execute_command(
     finished = False
     while not finished:
         if runtime and runtime.is_cancelled():
-            proc.terminate()
-            try:
-                proc.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                proc.kill()
+            terminate_process_tree(proc)
             done_event.wait(timeout=2)
             raise ToolCancelledError("execute_command cancelled")
         remaining = deadline - time.monotonic()
@@ -157,13 +210,28 @@ def execute_command(
         finished = done_event.wait(timeout=min(0.1, remaining))
 
     if not finished:
+        if runtime is not None and not runtime.allow_background_tasks:
+            terminate_process_tree(proc)
+            done_event.wait(timeout=2)
+            with output_lock:
+                output_so_far = "".join(output_lines)[-MAX_OUTPUT_CHARS:]
+            return ToolResult.fail(
+                f"命令超过 {timeout}s；当前 Agent 禁止转为后台任务",
+                data={"timed_out": True, "output_so_far": output_so_far},
+            )
         # 超时：不 kill，转后台
         task_id = f"task_{uuid.uuid4().hex[:8]}"
-        session.register_background_task(
-            _make_background_task(
-                task_id, proc, output_lines, done_event, output_lock
-            )
+        notify = runtime.notify_background_done if runtime else None
+        background = _make_background_task(
+            task_id, proc, output_lines, done_event, output_lock,
+            command=command,
+            root_turn_id=session.agent_root_turn_id,
+            on_done=(lambda: notify(task_id)) if notify is not None else None,
         )
+        background_holder[0] = background
+        session.register_background_task(background)
+        if done_event.is_set():
+            _notify_background_done()
         with output_lock:
             output_so_far = "".join(output_lines)[-MAX_OUTPUT_CHARS:]
         return ToolResult.success(
@@ -248,7 +316,10 @@ execute_command_tool = Tool(
 
 get_task_output_tool = Tool(
     name="get_task_output",
-    description="Get the current output and status of a background task.",
+    description=(
+        "Compatibility alias for shell tasks. Prefer get_task, which also supports "
+        "Agent tasks and returns the unified lifecycle model."
+    ),
     parameters={
         "type": "object",
         "properties": {
@@ -261,4 +332,5 @@ get_task_output_tool = Tool(
     },
     call=lambda args, runtime: get_task_output(**args, runtime=runtime),
     is_concurrency_safe=lambda args: True,
+    expose_to_model=False,
 )

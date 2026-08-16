@@ -132,3 +132,35 @@ def test_episode_tools_are_read_only_except_permissioned_forget(tmp_path):
         "search_episodes", "get_episode", "delete_episode"
     ]
     assert tools[-1].check_permission is not None
+
+
+def test_episode_captures_compact_subagent_execution_summary(tmp_path):
+    session = _completed_session(tmp_path)
+    task = session.control_plane.begin_task(
+        root_turn_id=session.agent_root_turn_id,
+        parent_id=None,
+        tool_call_id="spawn_1",
+        depth=1,
+        task="inspect auth",
+        requested_steps=5,
+    )
+    session.control_plane.finish_task(
+        task.id,
+        status="completed",
+        steps_used=2,
+        result="auth finding",
+    )
+
+    episode = episode_from_session(session, "已修复")
+
+    assert episode.agents == ({
+        "id": task.id,
+        "parent_id": None,
+        "depth": 1,
+        "task": "inspect auth",
+        "status": "completed",
+        "steps_used": 2,
+        "total_tokens": 0,
+        "result": "auth finding",
+        "error": "",
+    },)

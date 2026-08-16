@@ -23,6 +23,7 @@ MAX_EPISODE_GOAL_CHARS = 2_000
 MAX_EPISODE_OUTCOME_CHARS = 4_000
 MAX_EPISODE_TOOLS = 100
 MAX_EPISODE_VERIFICATIONS = 100
+MAX_EPISODE_AGENTS = 64
 MAX_EPISODE_FILE_BYTES = 256_000
 _EPISODE_ID_RE = re.compile(r"ep-[A-Za-z0-9_-]{1,180}")
 _locks_guard = threading.Lock()
@@ -49,6 +50,7 @@ class EpisodeRecord:
     created_at: str
     plan: dict[str, Any]
     tools: tuple[dict[str, Any], ...]
+    agents: tuple[dict[str, Any], ...]
     verification: tuple[dict[str, Any], ...]
     usage: dict[str, int]
 
@@ -64,6 +66,7 @@ class EpisodeRecord:
             "created_at": self.created_at,
             "plan": self.plan,
             "tools": list(self.tools),
+            "agents": list(self.agents),
             "verification": list(self.verification),
             "usage": self.usage,
         }
@@ -79,6 +82,7 @@ class EpisodeRecord:
         if status not in {"completed", "failed", "max_steps"}:
             raise EpisodeStoreError("episode status 非法")
         tools = value.get("tools", [])
+        agents = value.get("agents", [])
         verification = value.get("verification", [])
         plan = value.get("plan", {})
         usage = value.get("usage", {})
@@ -86,6 +90,12 @@ class EpisodeRecord:
             raise EpisodeStoreError("episode tools 非法")
         if len(tools) > MAX_EPISODE_TOOLS:
             raise EpisodeStoreError("episode tools 超出上限")
+        if not isinstance(agents, list) or not all(
+            isinstance(item, dict) for item in agents
+        ):
+            raise EpisodeStoreError("episode agents 非法")
+        if len(agents) > MAX_EPISODE_AGENTS:
+            raise EpisodeStoreError("episode agents 超出上限")
         if not isinstance(verification, list) or not all(
             isinstance(item, dict) for item in verification
         ):
@@ -116,6 +126,7 @@ class EpisodeRecord:
             created_at=_bounded_string(value.get("created_at"), "created_at", 100),
             plan=plan,
             tools=tuple(tools),
+            agents=tuple(agents),
             verification=tuple(verification),
             usage={
                 "prompt_tokens": _nonnegative_int(
@@ -308,6 +319,30 @@ def episode_from_session(session_state: Any, final_answer: str | None) -> Episod
     total_tokens = sum(
         turn.usage.total_tokens for turn in current_turns if turn.usage is not None
     )
+    agent_tree = getattr(session_state, "control_plane").tree_summary(
+        getattr(session_state, "agent_root_turn_id", "")
+    )
+
+    def flatten(nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        flattened: list[dict[str, Any]] = []
+        for node in nodes:
+            children = node.get("children", [])
+            flattened.append({
+                "id": node.get("id"),
+                "parent_id": node.get("parent_id"),
+                "depth": node.get("depth"),
+                "task": str(node.get("task", ""))[:300],
+                "status": node.get("status"),
+                "steps_used": node.get("steps_used", 0),
+                "total_tokens": node.get("total_tokens", 0),
+                "result": str(node.get("result", ""))[:500],
+                "error": str(node.get("error", ""))[:500],
+            })
+            if isinstance(children, list):
+                flattened.extend(flatten(children))
+        return flattened
+
+    agents = tuple(flatten(agent_tree)[:MAX_EPISODE_AGENTS])
     return EpisodeRecord(
         id=episode_id,
         session_id=str(session_state.session_id),
@@ -319,6 +354,7 @@ def episode_from_session(session_state: Any, final_answer: str | None) -> Episod
         created_at=datetime.now(timezone.utc).isoformat(),
         plan=getattr(session_state, "plan_manager").snapshot(),
         tools=tools,
+        agents=agents,
         verification=verification,
         usage={
             "prompt_tokens": prompt_tokens,
@@ -342,13 +378,18 @@ def read_episodes_for_surfacing(episodes: list[EpisodeRecord]) -> str:
         tool_line = ", ".join(
             f"{tool.get('name')}:{tool.get('status')}" for tool in episode.tools
         ) or "无"
+        agent_line = ", ".join(
+            f"{agent.get('id')}:{agent.get('status')}"
+            for agent in episode.agents
+        ) or "无"
         blocks.append(
             f"### {episode.id}\n"
             f"时间: {episode.created_at}\n"
             f"目标: {episode.goal}\n"
             f"状态: {episode.status}\n"
             f"结果: {episode.outcome}\n"
-            f"工具轨迹: {tool_line}"
+            f"工具轨迹: {tool_line}\n"
+            f"子 Agent: {agent_line}"
         )
     return "\n\n".join(blocks)
 

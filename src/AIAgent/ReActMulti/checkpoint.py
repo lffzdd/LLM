@@ -8,9 +8,11 @@ import os
 from pathlib import Path
 import re
 import tempfile
+import threading
 from typing import Any
 
 from .planning import PlanManager
+from .coordination import AgentControlError, AgentControlPlane
 from .session import (
     MessageRecord,
     SessionState,
@@ -39,6 +41,7 @@ class SessionCheckpointStore:
 
     def __init__(self, directory: Path) -> None:
         self.directory = directory.resolve()
+        self._save_lock = threading.RLock()
 
     def path_for(self, session_id: str) -> Path:
         if _SESSION_ID_PATTERN.fullmatch(session_id) is None:
@@ -46,6 +49,10 @@ class SessionCheckpointStore:
         return self.directory / f"{session_id}.json"
 
     def save(self, session: SessionState) -> Path:
+        with self._save_lock:
+            return self._save_unlocked(session)
+
+    def _save_unlocked(self, session: SessionState) -> Path:
         path = self.path_for(session.session_id)
         if not session.workspace_dir.is_dir():
             raise CheckpointError(
@@ -174,6 +181,10 @@ def _serialize_session(session: SessionState) -> dict[str, Any]:
                 for call_id, execution in session.tool_executions.items()
             },
             "plan": session.plan_manager.snapshot(),
+            "agent_control": session.control_plane.snapshot(),
+            "agent_task_id": session.agent_task_id,
+            "agent_root_turn_id": session.agent_root_turn_id,
+            "active_durable_run_id": session.active_durable_run_id,
             "last_usage": _serialize_usage(session.last_usage),
             "total_usage": _serialize_usage(session.total_usage),
             "context_tokens": session.context_tokens,
@@ -244,6 +255,23 @@ def _deserialize_session(payload: Any) -> SessionState:
     turns = _deserialize_turns(data.get("turns"))
     tool_executions = _deserialize_executions(data.get("tool_executions"))
     plan_manager = PlanManager.from_snapshot(_object(data.get("plan"), "plan"))
+    try:
+        control_plane = AgentControlPlane.from_snapshot(
+            data.get("agent_control", {}), mark_interrupted=True
+        )
+    except AgentControlError as exc:
+        raise CheckpointError(f"agent control snapshot 非法: {exc}") from exc
+    agent_task_id = data.get("agent_task_id")
+    if agent_task_id is not None and not isinstance(agent_task_id, str):
+        raise CheckpointError("agent_task_id 必须是字符串或 null")
+    agent_root_turn_id = data.get("agent_root_turn_id", "")
+    if not isinstance(agent_root_turn_id, str):
+        raise CheckpointError("agent_root_turn_id 必须是字符串")
+    active_durable_run_id = data.get("active_durable_run_id")
+    if active_durable_run_id is not None and not isinstance(
+        active_durable_run_id, str
+    ):
+        raise CheckpointError("active_durable_run_id 必须是字符串或 null")
 
     step_count = _nonnegative_int(data.get("step_count"), "step_count")
     active_turn_start_step = _nonnegative_int(
@@ -284,6 +312,10 @@ def _deserialize_session(payload: Any) -> SessionState:
         # execution history is restored; live background process handles are not.
         background_tasks={},
         plan_manager=plan_manager,
+        control_plane=control_plane,
+        agent_task_id=agent_task_id,
+        agent_root_turn_id=agent_root_turn_id,
+        active_durable_run_id=active_durable_run_id,
         active_turn_start_step=active_turn_start_step,
         active_turn_start_message_index=active_turn_start_message_index,
         last_usage=_deserialize_usage(data.get("last_usage"), "last_usage"),

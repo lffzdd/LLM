@@ -3,11 +3,13 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 import threading
-from typing import Any, Literal, TypeAlias
+import time
+from typing import Any, Callable, Literal, TypeAlias
 from uuid import uuid4
 
 from openai.types.chat import ChatCompletionMessageParam
 
+from .coordination import AgentControlPlane
 from .planning import PlanManager
 from .tools.base import ToolResult, ToolCall
 from .util import estimate_message_tokens
@@ -37,6 +39,15 @@ class SessionState:
     tool_executions: dict[CallId, ToolExecutionRecord]
     background_tasks: dict[str, BackgroundTask]
     plan_manager: PlanManager
+    # Root 与所有子 Agent 共享同一个控制面；子 session 用 agent_task_id
+    # 标记自己在任务树中的位置，root 则为 None。
+    control_plane: AgentControlPlane = field(default_factory=AgentControlPlane)
+    agent_task_id: str | None = None
+    agent_root_turn_id: str = ""
+    # Concrete durable run currently owning the root autonomous turn. The id
+    # is checkpointed so a restarted process can resume the transcript instead
+    # of blindly replaying the scheduled task from scratch.
+    active_durable_run_id: str | None = None
     # 当前 user turn 从哪个全局 step 之后开始。Verifier 用它隔离多轮 REPL 中
     # 旧任务的工具证据；checkpoint/resume 也靠它恢复本轮边界。
     active_turn_start_step: int = 0
@@ -58,6 +69,12 @@ class SessionState:
     _background_tasks_lock: threading.RLock = field(
         default_factory=threading.RLock, repr=False
     )
+    # Live threads and queues are process-local; checkpoints intentionally do
+    # not serialize them.  A restored session therefore treats live work as
+    # unknown via the existing control-plane recovery path.
+    agent_background_runtime: Any = field(default=None, repr=False, compare=False)
+    durable_task_store: Any = field(default=None, repr=False, compare=False)
+    autonomy_scheduler: Any = field(default=None, repr=False, compare=False)
 
     @classmethod
     def create(
@@ -93,6 +110,11 @@ class SessionState:
         with self._background_tasks_lock:
             return self.background_tasks.get(task_id)
 
+    def list_background_tasks(self) -> list["BackgroundTask"]:
+        """Return a stable registry snapshot; individual tasks remain live."""
+        with self._background_tasks_lock:
+            return list(self.background_tasks.values())
+
     def _next_step(self) -> int:
         self.step_count += 1
         return self.step_count
@@ -102,6 +124,10 @@ class SessionState:
         self.user_goal = prompt
         self.active_turn_start_step = self.step_count
         self.active_turn_start_message_index = len(self.message_records)
+        if self.agent_task_id is None:
+            self.agent_root_turn_id = (
+                f"{self.session_id}:{self.active_turn_start_message_index}"
+            )
 
     def _next_message_id(self) -> MessageId:
         self.message_id_counter += 1
@@ -352,3 +378,15 @@ class BackgroundTask:
     output_lock: threading.RLock = field(
         default_factory=threading.RLock, repr=False
     )
+    # reader 线程完成时调用；由 execute_command 在注册时写入，主循环
+    # 可借此收到统一的 TASK_DONE(task_id) 通知。
+    on_done: Callable[[], None] | None = field(default=None, repr=False)
+    # TaskService 需要的通用元数据。执行状态仍由 process + done 唯一决定，
+    # 这些字段只补充描述、归属和取消意图，不形成另一套状态机。
+    command: str = ""
+    root_turn_id: str = ""
+    created_at: float = field(default_factory=time.time)
+    started_at: float = field(default_factory=time.time)
+    ended_at: float | None = None
+    cancel_requested: bool = False
+    cancel_reason: str = ""

@@ -7,20 +7,26 @@ ReActMulti Agent 主入口模块（多工具版）
 """
 
 import argparse
+import json
 import os
+import queue
 import sys
+import threading
 from pathlib import Path
 
 from dotenv import load_dotenv
 from prompt_toolkit import PromptSession, prompt
 
 from .agent import Agent
+from .agent_background import AgentBackgroundRuntime
+from .autonomy import AutonomyScheduler, AutonomyStore, AutonomyStoreError
 from .checkpoint import CheckpointError, SessionCheckpointStore
 from .logger import get_logger
 from .memory import MemoryManager
 from .tools import tools as base_tools
 from .tools.ask_user_tool import ask_user_tool
 from .llm import LLMClient
+from .lifecycle import LifecycleConfigError, load_lifecycle_manager
 from .permission import (
     FallbackApprovalHandler,
     InteractiveApprovalHandler,
@@ -34,6 +40,7 @@ from .permission import (
 from .renderer import ConsoleRenderer
 from .session import SessionState
 from .subagent import build_agent_tools
+from .tasks import RuntimeTask, TaskNotFoundError, TaskService
 from .tools.mcp_client import McpManager, load_mcp_config
 from .verifier import Verifier
 
@@ -62,6 +69,11 @@ def parse_cli_args() -> argparse.Namespace:
         "--no-session-persistence",
         action="store_true",
         help="本次运行不保存 checkpoint",
+    )
+    parser.add_argument(
+        "--hooks-config",
+        metavar="PATH",
+        help="显式启用指定 lifecycle command hooks 配置（不会自动执行仓库配置）",
     )
     return parser.parse_args()
 
@@ -92,6 +104,164 @@ def _make_interaction_handler(renderer: ConsoleRenderer):
         )
 
     return handler
+
+
+def _task_notification_event(task: RuntimeTask) -> dict:
+    """Adapt a RuntimeTask into a runtime-event envelope for agent.run_runtime_event()."""
+    return {
+        "type": "task_notification",
+        "task": {
+            "id": task.id[:100],
+            "kind": task.kind,
+            "root_turn_id": task.root_turn_id[:180],
+            "status": task.status,
+            "description": task.description[:500],
+            "result": task.result[:2_000],
+            "output": task.output[-2_000:],
+            "error": task.error[:1_000],
+            "returncode": task.returncode,
+            "cancel_requested": task.cancel_requested,
+            "cancel_reason": task.cancel_reason[:500],
+        },
+    }
+
+
+def _last_final_answer(session: SessionState) -> str:
+    for turn in reversed(session.turns):
+        if turn.route != "final" or not isinstance(turn.parsed, dict):
+            continue
+        answer = turn.parsed.get("final_answer")
+        if answer is not None:
+            return str(answer)
+    return ""
+
+
+def _finish_durable_run(
+    agent: Agent,
+    scheduler: AutonomyScheduler,
+    run_id: str,
+    result: str | None,
+) -> None:
+    """Commit root-turn outcome, then clear the checkpoint ownership marker."""
+    session = agent.session_state
+    try:
+        scheduler.store.set_run_root_turn(run_id, session.agent_root_turn_id)
+        current = scheduler.store.get_run(run_id)
+        if current.cancel_requested:
+            status, error = "cancelled", current.cancel_reason or "run cancelled"
+        elif result is not None and session.status == "completed":
+            status, error = "completed", ""
+        else:
+            status = "failed"
+            error = f"autonomous Agent ended with session status={session.status}"
+        scheduler.finish_run(
+            run_id,
+            status=status,
+            result=result or "",
+            error=error,
+        )
+    finally:
+        session.active_durable_run_id = None
+        agent.checkpoint()
+
+
+def _execute_durable_run(
+    agent: Agent,
+    scheduler: AutonomyScheduler,
+    run_id: str,
+) -> None:
+    run = scheduler.store.get_run(run_id)
+    if run.status != "dispatched":
+        return
+    scheduler.store.start_run(run_id)
+    agent.session_state.active_durable_run_id = run_id
+    try:
+        result = agent.run_autonomous_event(
+            scheduler.runtime_event(run_id),
+            cancellation_check=lambda: scheduler.store.is_cancel_requested(run_id),
+            on_turn_started=lambda root_turn_id: scheduler.store.set_run_root_turn(
+                run_id, root_turn_id
+            ),
+        )
+    except Exception as exc:
+        scheduler.finish_run(
+            run_id,
+            status="failed",
+            error=f"{type(exc).__name__}: {exc}",
+        )
+        agent.session_state.active_durable_run_id = None
+        agent.checkpoint()
+        raise
+    _finish_durable_run(agent, scheduler, run_id, result)
+
+
+def _resume_durable_run(
+    agent: Agent,
+    scheduler: AutonomyScheduler,
+    run_id: str,
+) -> None:
+    try:
+        result = agent.continue_run(
+            cancellation_check=lambda: scheduler.store.is_cancel_requested(run_id)
+        )
+    except Exception as exc:
+        scheduler.finish_run(
+            run_id,
+            status="failed",
+            error=f"resume failed: {type(exc).__name__}: {exc}",
+        )
+        agent.session_state.active_durable_run_id = None
+        agent.checkpoint()
+        raise
+    _finish_durable_run(agent, scheduler, run_id, result)
+
+
+def _parse_external_event_command(value: str) -> tuple[str, dict]:
+    parts = value.strip().split(maxsplit=2)
+    if len(parts) < 2:
+        raise ValueError("用法: /event <name> [JSON object]")
+    payload: dict = {}
+    if len(parts) == 3:
+        parsed = json.loads(parts[2])
+        if not isinstance(parsed, dict):
+            raise ValueError("event payload 必须是 JSON object")
+        payload = parsed
+    return parts[1], payload
+
+
+def _start_input_reader(
+    renderer: ConsoleRenderer,
+    event_queue: "queue.Queue[tuple[str, object]]",
+    agent_idle: threading.Event,
+) -> threading.Thread:
+    """Keep terminal input blocking away from the session event consumer.
+
+    agent_idle 由主线程维护：
+      - agent.run() 结束后 set()（空闲）
+      - agent.run() 开始前 clear()（忙碌）
+
+    输入线程在【渲染提示符之前】先 wait()，确保 agent 空闲后才让用户看到输
+    入框；用户提交后立刻 clear() 再 put()，避免主线程来不及 clear 就被下一
+    次 wait() 穿透的竞态。
+    """
+    def read() -> None:
+        prompt_session: PromptSession[str] = PromptSession()
+        while True:
+            # 先等 agent 空闲，再渲染输入提示符——保证提示符不会出现在回答中间
+            agent_idle.wait()
+            value = renderer.prompt_main_input(prompt_session)
+            if value is None or value in {"/exit", "/quit"}:
+                event_queue.put(("EXIT", None))
+                return
+            if value:
+                # clear() 必须在 put() 之前：主线程 get() 后才 clear，
+                # 若放在 put() 后则 wait() 可能在主线程 clear() 前就穿透。
+                agent_idle.clear()
+                event_queue.put(("USER_INPUT", value))
+
+    thread = threading.Thread(target=read, name="react-input", daemon=True)
+    thread.start()
+    return thread
 
 
 
@@ -183,6 +353,31 @@ if __name__ == "__main__":
     except CheckpointError as exc:
         raise SystemExit(f"无法恢复会话: {exc}") from exc
 
+    event_queue: "queue.Queue[tuple[str, object]]" = queue.Queue()
+    background_runtime = AgentBackgroundRuntime(event_queue)
+    session_state.agent_background_runtime = background_runtime
+    autonomy_store = AutonomyStore(
+        workspace_dir / ".react_tasks" / "tasks.sqlite3",
+        session_id=session_state.session_id,
+        workspace_dir=workspace_dir,
+    )
+    autonomy_scheduler = AutonomyScheduler(autonomy_store, event_queue)
+    session_state.durable_task_store = autonomy_store
+    session_state.autonomy_scheduler = autonomy_scheduler
+    try:
+        lifecycle = load_lifecycle_manager(
+            workspace_dir,
+            session_state.session_id,
+            config_path=(Path(args.hooks_config) if args.hooks_config else None),
+        )
+    except LifecycleConfigError as exc:
+        raise SystemExit(f"无法加载 lifecycle hooks: {exc}") from exc
+    lifecycle.emit(
+        "session_start",
+        {"resumed": resumed, "workspace_dir": str(workspace_dir)},
+        root_turn_id=session_state.agent_root_turn_id,
+    )
+
 
     # MCP 接入:从 workspace 下的 .mcp.json 发现外部 stdio server,连接并把它们的工具
     # 翻译成本系统的 Tool。session 由 mcp_manager 持有,整段运行期保持存活,finally 关闭。
@@ -228,6 +423,7 @@ if __name__ == "__main__":
         depth=0,
         max_depth=2,
         permission_resolver=permission_resolver,
+        enable_autonomy=True,
     )
 
     # ask_user 与记忆工具只给主 Agent:都在 build_agent_tools 之后【单独追加】，不进
@@ -246,31 +442,153 @@ if __name__ == "__main__":
         memory=memory_manager,
         verifier=Verifier(verifier_llm),
         checkpoint_store=(None if args.no_session_persistence else checkpoint_store),
+        on_shell_task_done=lambda task_id: event_queue.put(("TASK_DONE", task_id)),
+        lifecycle=lifecycle,
     )
 
-    # ---- REPL：外层多轮循环 ----
-    # 对标 Claude Code 的 REPL：内层 agent.run() 把【一个 user turn】跑到 final_answer
-    # 就交还控制权;外层在这里读下一句输入,复用【同一个 agent / session】再 run。
-    # 历史天然续上。ask_user 会在工具执行期间直接阻塞等待用户输入，不需要退出/恢复主循环。
-    # 退出:Ctrl-D / Ctrl-C / 输入 /exit | /quit。
+    # Reconcile a crash that happened after Agent reached a terminal checkpoint
+    # but before the durable run row was committed. A genuinely running turn is
+    # protected from generic scheduler recovery and resumed below.
+    active_durable_run_id = session_state.active_durable_run_id
+    if active_durable_run_id and session_state.status != "running":
+        try:
+            active_run = autonomy_store.get_run(active_durable_run_id)
+        except AutonomyStoreError:
+            active_run = None
+        # If the row is already waiting_retry/queued/dispatched, the durable
+        # store committed its decision before the checkpoint marker was
+        # cleared. Do not finish it a second time from an invalid state.
+        if active_run is not None and active_run.status == "running":
+            if session_state.status == "completed":
+                autonomy_store.finish_run(
+                    active_durable_run_id,
+                    status="completed",
+                    result=_last_final_answer(session_state),
+                )
+            else:
+                autonomy_store.finish_run(
+                    active_durable_run_id,
+                    status="failed",
+                    error=(
+                        "checkpoint reached a terminal non-success session status: "
+                        f"{session_state.status}"
+                    ),
+                )
+        session_state.active_durable_run_id = None
+        agent.checkpoint()
+        active_durable_run_id = None
+
+    if active_durable_run_id:
+        try:
+            active_run = autonomy_store.get_run(active_durable_run_id)
+        except AutonomyStoreError:
+            active_run = None
+        if active_run is None or active_run.status != "running":
+            session_state.active_durable_run_id = None
+            session_state.mark_failed()
+            agent.checkpoint()
+            active_durable_run_id = None
+
+    autonomy_scheduler.start(active_run_id=active_durable_run_id)
+
+    # ---- Event-driven REPL ----
+    # Only this loop calls agent.run(), so user input and background completion
+    # notifications can never concurrently mutate the root SessionState.
+    #
+    # agent_idle：输入线程与主线程之间的同步信号。
+    #   主线程在 agent.run() 前 clear()，结束后 set()；
+    #   输入线程 put 完事件后 wait()，确保下一个提示符在回答渲染完毕后才出现。
+    agent_idle = threading.Event()
+    agent_idle.set()  # 初始为空闲状态，允许第一个提示符立即渲染
     try:
         if resumed:
             print(
                 f"已恢复 session {session_state.session_id} "
                 f"(status={session_state.status})"
             )
+            renderer.render_session_history(session_state)
             if session_state.status == "running":
-                agent.continue_run()
-        prompt_session: PromptSession[str] = PromptSession()
+                if active_durable_run_id:
+                    _resume_durable_run(
+                        agent, autonomy_scheduler, active_durable_run_id
+                    )
+                    active_durable_run_id = None
+                else:
+                    agent.continue_run()
+        _start_input_reader(renderer, event_queue, agent_idle)
         while True:
-            user_input = renderer.prompt_main_input(prompt_session)
-            if user_input is None or user_input in ("/exit", "/quit"):
+            event_type, payload = event_queue.get()
+            if event_type == "EXIT":
                 break
-            if not user_input:
-                continue
-            agent.run(user_input)
+            if event_type == "USER_INPUT":
+                # agent_idle 已由输入线程在 put() 前 clear()，无需重复 clear
+                user_input = str(payload)
+
+                # ── 斜杠命令拦截（不占 agent step，不进 context） ──
+                if user_input.strip().lower().startswith("/history"):
+                    arg = user_input.strip()[len("/history"):].strip().lower()
+                    if arg == "all":
+                        renderer.render_session_history(session_state, pager=True)
+                    elif arg.isdigit():
+                        renderer.render_session_history(
+                            session_state, max_turns=int(arg)
+                        )
+                    else:
+                        renderer.render_session_history(session_state)
+                    agent_idle.set()
+                    continue
+
+                if user_input.strip().lower().startswith("/event"):
+                    try:
+                        event_name, event_payload = _parse_external_event_command(
+                            user_input
+                        )
+                        event_id = autonomy_scheduler.emit_event(
+                            event_name, event_payload
+                        )
+                        print(f"📨 external event accepted (id={event_id})")
+                    except Exception as exc:
+                        print(f"external event rejected: {exc}")
+                    agent_idle.set()
+                    continue
+
+                try:
+                    agent.run(user_input)
+                finally:
+                    agent_idle.set()
+
+            elif event_type == "TASK_DONE":
+                # Agent/Shell 都只发送 task_id；主线程从唯一真实 owner 投影出
+                # 同一种 RuntimeTask 后再唤醒 Agent。
+                agent_idle.clear()
+                try:
+                    try:
+                        task = TaskService.for_session(session_state).get(str(payload))
+                    except TaskNotFoundError:
+                        logger.warning("忽略未知后台任务完成事件: %s", payload)
+                    else:
+                        agent.run_runtime_event(_task_notification_event(task))
+                finally:
+                    agent_idle.set()
+
+            elif event_type == "DURABLE_RUN_DUE":
+                agent_idle.clear()
+                try:
+                    _execute_durable_run(
+                        agent, autonomy_scheduler, str(payload)
+                    )
+                except Exception:
+                    logger.exception("durable task execution failed: %s", payload)
+                finally:
+                    agent_idle.set()
+
+            elif event_type == "AUTONOMY_ERROR":
+                logger.error("autonomy scheduler error: %s", payload)
         if agent.checkpoint_store:
             print(f"💾 会话已保存 (session_id: {session_state.session_id})")
     finally:
+        autonomy_scheduler.close()
+        background_runtime.shutdown(session_state.control_plane)
+        autonomy_store.close()
         # 关闭 MCP session / stdio 子进程,避免残留进程。
         mcp_manager.shutdown()

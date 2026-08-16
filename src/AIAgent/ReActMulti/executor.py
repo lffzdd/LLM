@@ -13,6 +13,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, replace
 from pathlib import Path
 import threading
+import time
 from typing import Callable
 
 from .permission import (
@@ -44,6 +45,8 @@ class ToolExecutor:
         tool_registry: dict[str, Tool],
         tool_timeout: float = 30,
         on_command_output: Callable[[str], None] | None = None,
+        on_progress: Callable[[dict], None] | None = None,
+        on_shell_task_done: Callable[[str], None] | None = None,
         permission_policy: PermissionPolicy | None = None,
         permission_approval_handler: PermissionApprovalHandler | None = None,
         permission_resolver: PermissionResolver | None = None,
@@ -51,6 +54,8 @@ class ToolExecutor:
         cwd_provider: Callable[[], Path] | None = None,
         session_state=None,
         cancellation_check: Callable[[], bool] | None = None,
+        allow_background_tasks: bool = True,
+        lifecycle=None,
     ):
         if tool_timeout <= 0:
             raise ValueError("tool_timeout 必须 > 0")
@@ -75,17 +80,79 @@ class ToolExecutor:
             )
         )
         self.cancellation_check = cancellation_check
+        self.lifecycle = lifecycle
         self.runtime = ToolRuntime(
             workspace_dir=self.workspace_dir,
             cwd_provider=self.cwd_provider,
             session_state=session_state,
             emit_output=on_command_output,
+            emit_progress=on_progress,
+            notify_background_done=on_shell_task_done,
+            allow_background_tasks=allow_background_tasks,
+            lifecycle=lifecycle,
         )
+
+    def _emit_lifecycle(self, event: str, payload: dict):
+        if self.lifecycle is None:
+            return None
+        return self.lifecycle.emit(
+            event,
+            payload,
+            agent_task_id=getattr(self.session_state, "agent_task_id", None),
+            root_turn_id=getattr(self.session_state, "agent_root_turn_id", ""),
+        )
+
+    def _prepare_tool_call(
+        self, tool_call: ToolCall
+    ) -> tuple[ToolCall, ToolResult | None]:
+        """Run schema + pre-tool hooks before concurrency is classified.
+
+        The returned call is an execution-only copy. SessionState has already
+        recorded the model's original input, so hook rewrites remain observable
+        without mutating history.
+        """
+        tool = self.tool_registry.get(tool_call.name)
+        if tool is None:
+            return tool_call, ToolResult.fail(err=f"Unknown tool: {tool_call.name}")
+        validation_error = validate_tool_arguments(tool, tool_call.arguments)
+        if validation_error is not None:
+            return tool_call, validation_error
+
+        arguments = dict(tool_call.arguments)
+        hook_decision = self._emit_lifecycle(
+            "pre_tool_use",
+            {
+                "tool_name": tool_call.name,
+                "tool_call_id": tool_call.id,
+                "arguments": arguments,
+                "cwd": str(self._current_cwd()),
+            },
+        )
+        if hook_decision is not None:
+            if hook_decision.decision == "deny":
+                return tool_call, ToolResult.fail(
+                    f"Hook denied: {hook_decision.reason}",
+                    data={
+                        "hook": {
+                            "decision": "deny",
+                            "reason": hook_decision.reason,
+                        }
+                    },
+                )
+            if hook_decision.updated_input is not None:
+                arguments = dict(hook_decision.updated_input)
+
+        effective_call = ToolCall(tool_call.name, arguments, tool_call.id)
+        updated_validation_error = validate_tool_arguments(tool, arguments)
+        if updated_validation_error is not None:
+            return effective_call, updated_validation_error
+        return effective_call, None
 
     def _invoke_tool(
         self,
         tool_call: ToolCall,
         local_cancel: threading.Event,
+        effective_timeout: float,
         on_call_start: Callable[[], None] | None = None,
     ) -> ToolResult:
         """查找并执行【单个】工具，返回标准化 tool_result。"""
@@ -97,12 +164,23 @@ class ToolExecutor:
         if validation_error is not None:
             return validation_error
 
+        arguments = dict(tool_call.arguments)
+
         runtime = replace(
             self.runtime,
             tool_name=tool_call.name,
             tool_call_id=tool_call.id,
             cancellation_check=lambda: local_cancel.is_set()
             or bool(self.cancellation_check and self.cancellation_check()),
+            cancellation_reason=lambda: (
+                "timeout"
+                if local_cancel.is_set()
+                else (
+                    "parent_cancelled"
+                    if self.cancellation_check and self.cancellation_check()
+                    else ""
+                )
+            ),
         )
 
         try:
@@ -110,13 +188,22 @@ class ToolExecutor:
         except ToolCancelledError as e:
             return ToolResult.fail(str(e))
 
+        effective_call = ToolCall(tool_call.name, arguments, tool_call.id)
         permission = self.permission_resolver.resolve(
-            tool_call,
+            effective_call,
             tool,
             runtime=runtime,
             cwd=self._current_cwd(),
             workspace_dir=self.workspace_dir,
         )
+        self._emit_lifecycle("permission_decision", {
+            "tool_name": tool_call.name,
+            "tool_call_id": tool_call.id,
+            "decision": permission.decision,
+            "reason": permission.reason,
+            "risk_flags": list(permission.risk_flags),
+            "source": permission.source,
+        })
         if permission.decision != "allow":
             return ToolResult.fail(
                 err=f"Permission denied: {permission.reason}",
@@ -133,7 +220,7 @@ class ToolExecutor:
         # 浅拷贝再改:钳超时是执行期的局部需要,不能回写 tool_call.arguments
         # ——那个 dict 同一对象被 session 记账引用着,原地改会篡改"已记录的历史输入"。
         arguments = dict(
-            tool_call.arguments
+            arguments
             if permission.updated_arguments is None
             else permission.updated_arguments
         )
@@ -145,7 +232,7 @@ class ToolExecutor:
         # 内层超时必须 ≤ 外层线程预算:模型可以给工具传很大的 timeout,
         # 不钳制的话外层先掐,工具内部的超时机制(如 execute_command 转后台)永远轮不到登场
         if isinstance(arguments.get("timeout"), (int, float)):
-            arguments["timeout"] = min(arguments["timeout"], self.tool_timeout)
+            arguments["timeout"] = min(arguments["timeout"], effective_timeout)
 
         try:
             runtime.raise_if_cancelled()
@@ -181,10 +268,18 @@ class ToolExecutor:
         tool = self.tool_registry.get(tool_call.name)
         local_cancel = threading.Event()
         timer: threading.Timer | None = None
+        effective_timeout = (
+            tool.execution_timeout
+            if tool is not None and tool.execution_timeout is not None
+            else self.tool_timeout
+        )
+        if effective_timeout <= 0:
+            effective_timeout = self.tool_timeout
+        started = time.monotonic()
 
         def start_deadline() -> None:
             nonlocal timer
-            timer = threading.Timer(self.tool_timeout, local_cancel.set)
+            timer = threading.Timer(effective_timeout, local_cancel.set)
             timer.daemon = True
             timer.start()
 
@@ -192,6 +287,7 @@ class ToolExecutor:
             result = self._invoke_tool(
                 tool_call,
                 local_cancel,
+                effective_timeout,
                 on_call_start=(
                     start_deadline
                     if tool is not None and tool.timeout_owner == "executor"
@@ -204,11 +300,23 @@ class ToolExecutor:
 
         if local_cancel.is_set():
             result = ToolResult.fail(
-                f"timeout: 超过 {self.tool_timeout}s，工具已响应取消并退出"
+                f"timeout: 超过 {effective_timeout}s，工具已响应取消并退出",
+                data=result.data,
             )
             status: ToolExecutionTerminal = "timeout"
         else:
             status = "succeeded" if result.ok else "failed"
+
+        self._emit_lifecycle(
+            "post_tool_use" if result.ok else "tool_failure",
+            {
+                "tool_name": tool_call.name,
+                "tool_call_id": tool_call.id,
+                "status": status,
+                "duration_ms": round((time.monotonic() - started) * 1_000, 3),
+                "result": result.to_dict(),
+            },
+        )
 
         return idx, ToolExecutionOutcome(
             call=tool_call,
@@ -253,12 +361,12 @@ class ToolExecutor:
         return out
 
     def _partition_calls(
-        self, tool_calls: list[ToolCall]
+        self, indexed_calls: list[tuple[int, ToolCall]]
     ) -> list[list[tuple[int, ToolCall]]]:
         """保持原始顺序：连续安全调用合并成并发批，不安全调用各自单独成批。"""
         batches: list[list[tuple[int, ToolCall]]] = []
         previous_batch_is_safe = False
-        for indexed in enumerate(tool_calls):
+        for indexed in indexed_calls:
             _, tool_call = indexed
             safe = self._is_concurrency_safe(tool_call)
             if safe and batches and previous_batch_is_safe:
@@ -283,16 +391,45 @@ class ToolExecutor:
 
         on_call 先按输入顺序全报一遍("这一轮要调这些工具"),再开跑。
         """
-        if on_call:
-            for tool_call in tool_calls:
-                on_call(tool_call)
-
         slots: list[ToolExecutionOutcome | None] = [None] * len(tool_calls)
 
         if max_workers < 1:
             raise ValueError("max_workers 必须 >= 1")
 
-        for batch in self._partition_calls(tool_calls):
+        prepared: list[tuple[int, ToolCall, ToolResult | None]] = []
+        for idx, tool_call in enumerate(tool_calls):
+            effective_call, error = self._prepare_tool_call(tool_call)
+            prepared.append((idx, effective_call, error))
+
+        if on_call:
+            for _, effective_call, _ in prepared:
+                on_call(effective_call)
+
+        runnable: list[tuple[int, ToolCall]] = []
+        for idx, effective_call, error in prepared:
+            if error is None:
+                runnable.append((idx, effective_call))
+                continue
+            outcome = ToolExecutionOutcome(
+                call=effective_call,
+                result=error,
+                status="failed",
+            )
+            slots[idx] = outcome
+            self._emit_lifecycle(
+                "tool_failure",
+                {
+                    "tool_name": effective_call.name,
+                    "tool_call_id": effective_call.id,
+                    "status": "failed",
+                    "duration_ms": 0,
+                    "result": error.to_dict(),
+                },
+            )
+            if on_result:
+                on_result(error)
+
+        for batch in self._partition_calls(runnable):
             for idx, slot in self._run_concurrent_batch(
                 batch, on_result, min(max_workers, len(batch))
             ).items():

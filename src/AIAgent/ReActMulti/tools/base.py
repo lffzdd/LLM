@@ -33,6 +33,9 @@ class ToolRuntime:
     workspace_dir: Path | None = None
     cwd_provider: Callable[[], Path] | None = None
     session_state: Any = None
+    # Session-scoped lifecycle bus. Kept process-local and intentionally absent
+    # from tool schemas/checkpoints.
+    lifecycle: Any = None
 
     # 文本流式输出:例如 shell stdout。命名保持通用,不绑定 command 工具。
     emit_output: Callable[[str], None] | None = None
@@ -40,8 +43,15 @@ class ToolRuntime:
     # 结构化进度事件:未来可用于下载进度、批处理进度、后台任务状态等。
     emit_progress: Callable[[dict[str, Any]], None] | None = None
 
+    # Shell 后台任务完成时主动通知主循环。task_id 作为参数传入回调，主循环
+    # 再通过 TaskService 解析统一 RuntimeTask。None 则不通知。
+    notify_background_done: Callable[[str], None] | None = None
+
     # 每次调用独立的取消信号。工具里的长循环/阻塞分段应定期检查。
     cancellation_check: Callable[[], bool] | None = None
+    cancellation_reason: Callable[[], str] | None = None
+    # 子 Agent 生命周期结束后不能留下无人管理的后台进程。
+    allow_background_tasks: bool = True
 
     def is_cancelled(self) -> bool:
         return bool(self.cancellation_check and self.cancellation_check())
@@ -51,6 +61,9 @@ class ToolRuntime:
             raise ToolCancelledError(
                 f"{self.tool_name or 'tool'} cancelled"
             )
+
+    def get_cancellation_reason(self) -> str:
+        return self.cancellation_reason() if self.cancellation_reason else ""
 
 
 def _default_check_permission(
@@ -79,6 +92,12 @@ class Tool:
     requires_user_interaction: bool = False
     # executor:统一 deadline + 协作取消；tool:工具自己定义超时语义(如 shell 转后台)。
     timeout_owner: TimeoutOwner = "executor"
+    # 可选的工具专属 executor deadline。None 使用 Agent 的通用 tool_timeout；
+    # 子 Agent 这类长任务需要比普通文件/网络工具更长的独立预算。
+    execution_timeout: float | None = None
+    # Compatibility aliases may remain executable for resumed/old transcripts
+    # without teaching new model turns a duplicate API surface.
+    expose_to_model: bool = True
 
     def to_dict(self):
         # 并发与超时策略是系统调度元数据,不喂给模型。
