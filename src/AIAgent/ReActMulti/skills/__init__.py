@@ -1,11 +1,9 @@
-"""Skills：按需加载的领域流程，激活状态归 SessionState。"""
+"""Skills：磁盘上的领域流程，调用时把正文写入 tool_result。"""
 
 from __future__ import annotations
 
 from .registry import SkillRegistry
 from .types import (
-    MAX_ACTIVE_SKILLS,
-    SkillActivationError,
     SkillDefinition,
     SkillMeta,
     SkillNotFoundError,
@@ -23,8 +21,6 @@ def optional_skill_tools(registry: SkillRegistry):
 
 
 __all__ = [
-    "MAX_ACTIVE_SKILLS",
-    "SkillActivationError",
     "SkillDefinition",
     "SkillMeta",
     "SkillNotFoundError",

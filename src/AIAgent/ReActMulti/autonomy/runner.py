@@ -55,9 +55,7 @@ _DURABLE_EXCLUDED_TOOLS = frozenset({
     "get_episode",
     "delete_episode",
     "knowledge_search",
-    "list_skills",
-    "load_skill",
-    "unload_skill",
+    "skill",
 })
 
 _UNATTENDED_DENY_NOTE = (

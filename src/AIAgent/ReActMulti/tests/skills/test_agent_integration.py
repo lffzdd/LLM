@@ -46,14 +46,20 @@ def _write_skill(directory: Path) -> SkillRegistry:
     return SkillRegistry(directory)
 
 
-def test_parent_and_child_sessions_isolate_activation(tmp_path: Path):
-    registry = _write_skill(tmp_path)
+def _catalog_texts(messages) -> list[str]:
+    return [
+        str(message.get("content", ""))
+        for message in messages
+        if "<skill-catalog>" in str(message.get("content", ""))
+    ]
+
+
+def test_parent_and_child_sessions_isolate_catalog_flag(tmp_path: Path):
     parent = SessionState.create("parent", tmp_path)
     child = SessionState.create("child", tmp_path)
-    parent.activate_skill("release-check")
-    assert parent.get_active_skill_ids() == ["release-check"]
-    assert child.get_active_skill_ids() == []
-    assert registry.get("release-check").id == "release-check"
+    parent.mark_skill_catalog_sent()
+    assert parent.skill_catalog_sent is True
+    assert child.skill_catalog_sent is False
 
 
 def test_empty_skills_directory_injects_nothing(tmp_path: Path):
@@ -62,7 +68,6 @@ def test_empty_skills_directory_injects_nothing(tmp_path: Path):
     Agent(llm, [], session, SilentRenderer(), skills=SkillRegistry(tmp_path)).run("hi")
     assert not any(
         "<skill-catalog>" in str(message.get("content", ""))
-        or "<skill id=" in str(message.get("content", ""))
         for batch in llm.seen_messages
         for message in batch
     )
@@ -70,12 +75,13 @@ def test_empty_skills_directory_injects_nothing(tmp_path: Path):
         "<system-reminder>" in str(record.message.get("content", ""))
         for record in session.message_records
     )
+    assert session.skill_catalog_sent is True
 
 
-def test_catalog_and_body_are_ephemeral(tmp_path: Path):
+def test_catalog_is_written_once_into_transcript(tmp_path: Path):
     registry = _write_skill(tmp_path)
     llm = ScriptLLM([
-        _tool("load_skill", skill_id="release-check"),
+        _tool("skill", skill_id="release-check"),
         _final("已按流程检查"),
     ])
     session = SessionState.create("task", tmp_path)
@@ -85,46 +91,28 @@ def test_catalog_and_body_are_ephemeral(tmp_path: Path):
     ).run("准备发布")
 
     assert answer == "已按流程检查"
-    assert "<skill-catalog>" in llm.seen_messages[0][-1]["content"]
-    assert "release-check" in llm.seen_messages[0][-1]["content"]
-    assert "<skill id=" not in llm.seen_messages[0][-1]["content"]
+    assert session.skill_catalog_sent is True
 
-    assert "<skill id=\"release-check\"" in llm.seen_messages[1][-1]["content"]
-    assert "发布前必须先跑测试" in llm.seen_messages[1][-1]["content"]
+    first_catalogs = _catalog_texts(llm.seen_messages[0])
+    assert len(first_catalogs) == 1
+    assert "release-check" in first_catalogs[0]
+    assert "调用 skill 工具" in first_catalogs[0]
+
+    second_catalogs = _catalog_texts(llm.seen_messages[1])
+    assert len(second_catalogs) == 1
+    assert "发布前必须先跑测试" in str(llm.seen_messages[1][-1].get("content", ""))
 
     transcript = [
         str(record.message.get("content", ""))
         for record in session.message_records
     ]
-    assert all("<skill-catalog>" not in text for text in transcript)
-    assert all("<skill id=" not in text for text in transcript)
+    assert sum("<skill-catalog>" in text for text in transcript) == 1
+    assert any("发布前必须先跑测试" in text for text in transcript)
 
 
-def test_unload_removes_body_from_next_turn(tmp_path: Path):
+def test_second_user_turn_does_not_resend_catalog(tmp_path: Path):
     registry = _write_skill(tmp_path)
     llm = ScriptLLM([
-        _tool("load_skill", skill_id="release-check"),
-        _tool("unload_skill", skill_id="release-check"),
-        _final("已卸载"),
-    ])
-    session = SessionState.create("task", tmp_path)
-    Agent(
-        llm,
-        build_skill_tools(registry),
-        session,
-        SilentRenderer(),
-        skills=registry,
-    ).run("准备发布")
-
-    assert "<skill id=\"release-check\"" in llm.seen_messages[1][-1]["content"]
-    assert "<skill id=\"release-check\"" not in llm.seen_messages[2][-1]["content"]
-    assert session.get_active_skill_ids() == []
-
-
-def test_new_user_turn_resets_activation(tmp_path: Path):
-    registry = _write_skill(tmp_path)
-    llm = ScriptLLM([
-        _tool("load_skill", skill_id="release-check"),
         _final("第一轮完成"),
         _final("第二轮完成"),
     ])
@@ -137,13 +125,16 @@ def test_new_user_turn_resets_activation(tmp_path: Path):
         skills=registry,
     )
     assert agent.run("发布") == "第一轮完成"
-    assert session.get_active_skill_ids() == ["release-check"]
     assert agent.run("另一件事") == "第二轮完成"
-    assert session.get_active_skill_ids() == []
-    assert "<skill id=\"release-check\"" not in llm.seen_messages[2][-1]["content"]
+    transcript = [
+        str(record.message.get("content", ""))
+        for record in session.message_records
+    ]
+    assert sum("<skill-catalog>" in text for text in transcript) == 1
+    assert len(_catalog_texts(llm.seen_messages[1])) == 1
 
 
-def test_continue_run_keeps_activation(tmp_path: Path):
+def test_continue_run_keeps_catalog_and_does_not_resend(tmp_path: Path):
     registry = _write_skill(tmp_path)
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -151,19 +142,22 @@ def test_continue_run_keeps_activation(tmp_path: Path):
     session = SessionState.create("task", workspace)
     session.begin_user_turn("准备发布")
     session.append_message({"role": "user", "content": "准备发布"})
-    session.activate_skill("release-check")
+    session.append_message({
+        "role": "user",
+        "content": "<system-reminder>\n<skill-catalog>\n- release-check: 发布\n</skill-catalog>\n</system-reminder>",
+    })
+    session.mark_skill_catalog_sent()
     store.save(session)
 
     restored = store.load(session.session_id)
-    assert restored.get_active_skill_ids() == ["release-check"]
+    assert restored.skill_catalog_sent is True
     llm = ScriptLLM([_final("继续")])
     answer = Agent(
         llm, [], restored, SilentRenderer(), skills=registry
     ).continue_run()
     assert answer == "继续"
-    assert restored.get_active_skill_ids() == ["release-check"]
-    assert "发布前必须先跑测试" in llm.seen_messages[0][-1]["content"]
-    assert all(
-        "<skill id=" not in str(record.message.get("content", ""))
+    transcript = [
+        str(record.message.get("content", ""))
         for record in restored.message_records
-    )
+    ]
+    assert sum("<skill-catalog>" in text for text in transcript) == 1

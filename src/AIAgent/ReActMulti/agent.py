@@ -14,7 +14,7 @@ from .llm import LLMClient
 from .prompt import build_system_prompt
 from .renderer import Renderer
 from .session import SessionState, UsageRecord
-from .skills.prompt import active_bodies_reminder, catalog_reminder
+from .skills.prompt import catalog_reminder
 from .skills.registry import SkillRegistry
 from .protocol import TurnAbort, parse_turn
 from .tools.base import Tool
@@ -54,7 +54,7 @@ class Agent:
         # 长期记忆协作者:只主 Agent 注入,子 Agent 传 None(保持纯净隔离上下文)。
         # Agent 只在主循环里喊它三声:构造时取指令、每轮注入召回、收口后提取落盘。
         self.memory = memory
-        # Skill 清单和正文走每轮临时注入，绝不改已经冻结的 system prompt。
+        # Skill 目录只写入 transcript 一次；正文走 skill 工具的 tool_result。
         self.skills = skills
         self.verifier = verifier
         self.max_verification_retries = max_verification_retries
@@ -232,8 +232,7 @@ class Agent:
         usage_record: UsageRecord | None = None
 
         wire_messages = self.session_state.wire_messages()
-        # 计划 / skill 都是运行期状态，不永久复制进 transcript。每轮临时放在
-        # wire 尾部；卸载 skill 后下一轮自然消失。空目录时完全不改变原消息流。
+        # 计划是运行期状态，不永久复制进 transcript。每轮临时放在 wire 尾部。
         if extra_messages:
             wire_messages.extend(extra_messages)
 
@@ -292,30 +291,20 @@ class Agent:
         # 并由 to_prompt_block 的 JSON 数据边界明确它不具备指令权限。
         return {"role": "user", "content": block} if block else None
 
-    def _skill_reminders(self) -> list[ChatCompletionMessageParam]:
-        if self.skills is None:
-            return []
-        messages: list[ChatCompletionMessageParam] = []
+    def _ensure_skill_catalog(self) -> None:
+        """会话里只把 skill 目录写入 transcript 一次。"""
+        if self.skills is None or self.session_state.skill_catalog_sent:
+            return
         catalog = catalog_reminder(self.skills.list_metas())
         if catalog:
-            messages.append({"role": "user", "content": catalog})
-        definitions = []
-        for skill_id in self.session_state.get_active_skill_ids():
-            try:
-                definitions.append(self.skills.get(skill_id))
-            except Exception:
-                continue
-        bodies = active_bodies_reminder(definitions)
-        if bodies:
-            messages.append({"role": "user", "content": bodies})
-        return messages
+            self.session_state.append_message({"role": "user", "content": catalog})
+        self.session_state.mark_skill_catalog_sent()
 
     def _ephemeral_reminders(self) -> list[ChatCompletionMessageParam]:
         reminders: list[ChatCompletionMessageParam] = []
         plan = self._plan_reminder()
         if plan is not None:
             reminders.append(plan)
-        reminders.extend(self._skill_reminders())
         return reminders
 
     def _record_usage_for_turn(
@@ -376,11 +365,10 @@ class Agent:
         if max_steps <= 0:
             raise ValueError("max_steps 必须 > 0")
         self.session_state.max_steps = max_steps
-        # Plan / 激活 skill 都是 user-turn 级状态，不是跨任务记忆。
+        # 计划是 user-turn 级状态，不是跨任务记忆。
         # 首轮允许装配层预置；后续 run() 开始新目标时清空，continue_run() 则保留。
         if self.session_state.turns:
             self.session_state.plan_manager.reset()
-            self.session_state.reset_active_skills()
         # 重置上一轮的终态,使 status 始终反映"当前这轮"(多轮 REPL 下尤其需要)。
         self.session_state.mark_running()
         self.session_state.begin_user_turn(prompt)
@@ -418,6 +406,7 @@ class Agent:
                     {"role": "user", "content": recall_block}
                 )
 
+        self._ensure_skill_catalog()
         self._checkpoint()
         self._emit_agent_start(prompt)
 
@@ -504,6 +493,7 @@ class Agent:
                 f"{self.session_state.session_id}:"
                 f"{self.session_state.active_turn_start_message_index}"
             )
+        self._ensure_skill_catalog()
         self._checkpoint()
         self._emit_agent_start(self.session_state.user_goal, resumed=True)
         return self._run_with_cancellation(

@@ -1,4 +1,4 @@
-"""Skill 的磁盘元数据。激活状态不在这里——它属于 SessionState。"""
+"""Skill 的磁盘元数据。目录是否已注入 transcript 属于 SessionState。"""
 
 from __future__ import annotations
 
@@ -7,10 +7,8 @@ from pathlib import Path
 import re
 
 
-MAX_ACTIVE_SKILLS = 3
 MAX_SKILL_FILE_BYTES = 64_000
 MAX_SKILL_BODY_CHARS = 8_000
-MAX_ACTIVE_BODY_CHARS = 12_000
 MAX_SKILLS = 40
 MAX_SKILL_NAME_CHARS = 80
 MAX_SKILL_DESCRIPTION_CHARS = 400
@@ -27,10 +25,6 @@ class SkillStoreError(ValueError):
 
 class SkillNotFoundError(SkillStoreError):
     pass
-
-
-class SkillActivationError(ValueError):
-    """当前会话无法再激活该 skill（数量或正文上限）。"""
 
 
 @dataclass(frozen=True)

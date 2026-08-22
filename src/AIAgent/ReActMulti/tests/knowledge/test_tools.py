@@ -91,6 +91,7 @@ def test_child_keeps_knowledge_search_but_drops_skill_tools(tmp_path):
     ])
     names = {tool.name for tool in tools}
     assert "knowledge_search" in names
+    assert "skill" not in names
     assert "list_skills" not in names
     assert "load_skill" not in names
     assert "unload_skill" not in names

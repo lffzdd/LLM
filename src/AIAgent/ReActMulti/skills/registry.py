@@ -10,7 +10,7 @@ from .types import SkillDefinition, SkillMeta, SkillNotFoundError, SkillStoreErr
 
 
 class SkillRegistry:
-    """同一 directory 上线程安全的只读视图。激活状态不在这里。"""
+    """同一 directory 上线程安全的只读视图。会话注入状态不在这里。"""
 
     def __init__(self, directory: Path) -> None:
         self.directory = directory.expanduser().resolve()

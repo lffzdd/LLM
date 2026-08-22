@@ -213,6 +213,7 @@ def test_durable_session_omits_ask_user_and_autonomy_tools(tmp_path):
     assert "search_memory" not in names
     assert "save_memory" not in names
     assert "knowledge_search" not in names
+    assert "skill" not in names
     assert "list_skills" not in names
     assert "load_skill" not in names
     assert "unload_skill" not in names

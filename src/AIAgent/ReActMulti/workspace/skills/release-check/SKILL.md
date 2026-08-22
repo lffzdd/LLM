@@ -6,7 +6,7 @@ allowed_tools: [execute_command, read_file]
 
 # 发布前检查
 
-这是一份可复用的发布前核对流程。加载后按步骤执行，完成后调用 `unload_skill`。
+这是一份可复用的发布前核对流程。调用 skill 工具加载后按步骤执行。
 
 ## 步骤
 
