@@ -11,6 +11,8 @@ from pathlib import Path
 import sys
 import threading
 
+from dotenv import dotenv_values
+
 from .provider import (
     KnowledgeHit,
     KnowledgeUnavailable,
@@ -74,6 +76,7 @@ class RagKnowledgeProvider:
         self._chain: object | None = None
         self._init_error: str | None = None
         self._init_attempts = 0
+        self._dotenv_cache: dict[str, str] | None = None
 
     @classmethod
     def from_env(cls) -> RagKnowledgeProvider:
@@ -136,6 +139,11 @@ class RagKnowledgeProvider:
             retriever_type=self.retriever_type,
             use_reranker=self.use_reranker,
             query_rewrite="none",
+            embedding_api_key=api_key,
+            # knowledge_search 只使用检索器，不调用 RAGChain 的生成 LLM。
+            # 仍给 OpenAI client 一个有效凭据，避免无关的构造期失败。
+            llm_api_key=self._resolved_llm_api_key() or api_key,
+            reranker_api_key=api_key,
         )
         loaded = chain.load_index(self.index_path)
         if not loaded:
@@ -150,8 +158,31 @@ class RagKnowledgeProvider:
             return self._api_key.strip()
         return (
             os.environ.get("SILICONFLOW_API_KEY", "").strip()
+            or self._dotenv_value("SILICONFLOW_API_KEY")
             or os.environ.get("LLM_API_KEY", "").strip()
+            or self._dotenv_value("LLM_API_KEY")
         )
+
+    def _resolved_llm_api_key(self) -> str:
+        return (
+            os.environ.get("LLM_API_KEY", "").strip()
+            or self._dotenv_value("LLM_API_KEY")
+        )
+
+    def _dotenv_value(self, name: str) -> str:
+        """只读 RAG 自己的 .env，不修改进程环境，也不暴露其他配置。"""
+        if self._dotenv_cache is None:
+            env_path = self._rag_dir / ".env"
+            try:
+                values = dotenv_values(env_path) if env_path.is_file() else {}
+            except (OSError, ValueError):
+                values = {}
+            self._dotenv_cache = {
+                str(key): str(value).strip()
+                for key, value in values.items()
+                if value is not None
+            }
+        return self._dotenv_cache.get(name, "")
 
     def _import_rag_chain(self):
         rag_dir = str(self._rag_dir)

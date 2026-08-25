@@ -84,13 +84,22 @@ class RAGChain:
         use_reranker: bool = False,  # 是否启用 Cross-encoder 重排序
         # 查询改写
         query_rewrite: str = "none",  # "none" | "rewrite" | "hyde" | "multi_query"
+        # 可选凭据覆盖：供只使用检索层的外部适配器显式注入，
+        # 不传时保持原有 config / 环境变量行为。
+        embedding_api_key: str | None = None,
+        llm_api_key: str | None = None,
+        reranker_api_key: str | None = None,
     ):
         # ===== 初始化 Embedder =====
         if embedder_type == "api":
             print("🔧 初始化 API Embedder...")
             self.embedder = APIEmbedder(
                 base_url=config.embedding_base_url,
-                api_key=config.embedding_api_key or config.llm_api_key,
+                api_key=(
+                    embedding_api_key
+                    if embedding_api_key is not None
+                    else config.embedding_api_key or config.llm_api_key
+                ),
                 model=config.embedding_model,
             )
         elif embedder_type == "local":
@@ -113,7 +122,9 @@ class RAGChain:
         print("🔧 初始化 LLM 客户端...")
         self.llm_client = OpenAI(
             base_url=config.llm_base_url,
-            api_key=config.llm_api_key,
+            api_key=(
+                llm_api_key if llm_api_key is not None else config.llm_api_key
+            ),
         )
         self.llm_model = config.llm_model
 
@@ -139,7 +150,11 @@ class RAGChain:
         if use_reranker:
             print("🔧 初始化 Reranker (Cross-encoder)...")
             self.reranker = APIReranker(
-                api_key=config.reranker_api_key,
+                api_key=(
+                    reranker_api_key
+                    if reranker_api_key is not None
+                    else config.reranker_api_key
+                ),
                 model=config.reranker_model,
                 base_url=config.reranker_base_url,
             )
